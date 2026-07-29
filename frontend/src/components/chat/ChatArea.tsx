@@ -51,15 +51,16 @@ export default function ChatArea({
     <main className="flex-1 flex flex-col h-screen bg-gray-50/50 min-w-0">
       {/* 顶部工具栏 */}
       {hasMessages && (
-        <div className="flex items-center justify-between px-6 py-2 border-b border-gray-100 bg-white/80 backdrop-blur-sm relative">
+        <div className="flex items-center justify-between px-6 py-2 border-b border-gray-100 bg-white/80 backdrop-blur-sm">
           <span className="text-xs text-gray-400">DeepAgent 智能助手</span>
           <div className="flex items-center gap-2">
-            {/* TODO 任务列表 - 右上角悬浮 */}
-            <TodoListPanel items={todoItems} visible={todoVisible} />
             <ToolCallToggle show={showToolCalls} onToggle={setShowToolCalls} />
           </div>
         </div>
       )}
+
+      {/* TODO 任务列表 - 最顶层悬浮（在 main 层级，不被任何父级影响） */}
+      <TodoListPanel items={todoItems} visible={todoVisible} />
 
       {/* Harness 阶段指示器 */}
       <HarnessPhaseBar phase={phase} phaseLabel={phaseLabel} visible={streaming || phase === "done"} />
