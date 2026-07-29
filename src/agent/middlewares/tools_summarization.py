@@ -1,6 +1,6 @@
 """
 中间件 5: compact_conversation 工具注册
-提供手动触发对话压缩的工具，当上下文过长时由 LLM 主动调用
+提供手动触发对话压缩的工具，当上下文过长时由 LLM 主动调用。
 """
 from typing import Any
 

@@ -20,7 +20,7 @@ def download_sandbox_file(remote_path: str) -> str:
         remote_path: 源文件路径（沙箱内或本地工作目录中的路径）
 
     Returns:
-        下载后的本地文件路径
+        下载后的本地文件路径。
     """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 

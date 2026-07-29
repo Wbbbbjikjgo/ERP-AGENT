@@ -12,7 +12,7 @@ from .web_config import get_db
 
 
 class AgentLoader:
-    """Agent 加载器单例 - 管理 Agent 生命周期"""
+    """Agent 加载器单例 - 管理 Agent 生命周期."""
 
     _instance: Optional['AgentLoader'] = None
 

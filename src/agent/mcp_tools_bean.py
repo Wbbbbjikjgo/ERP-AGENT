@@ -1,6 +1,6 @@
 """
 MCP 工具分类 Bean
-将 MCP 工具按用途分组：analyst_tools / order_tools
+将 MCP 工具按用途分组：analyst_tools / order_tools。
 """
 from typing import List
 from langchain_core.tools import BaseTool

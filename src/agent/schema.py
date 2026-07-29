@@ -1,6 +1,7 @@
 """
 数据模型定义
 ProcurementContext、UserPreferences、ChatRequest 等 Pydantic 模型
+定义整个项目中流转的数据结构。这是类型安全的保障——所有请求、响应、上下文都通过这些模型约束。
 """
 from typing import Optional, List
 from pydantic import BaseModel, Field
@@ -9,6 +10,7 @@ from datetime import datetime
 
 class UserPreferences(BaseModel):
     """用户偏好模型"""
+    #Field 是 Pydantic 库中的一个函数，用于为数据模型的字段添加元数据（额外的描述信息）和验证规则。 例如default  description 还有min_length max_length等等
     preferred_output: str = Field(default="markdown", description="首选输出格式: markdown/table/json")
     preferred_chart_type: str = Field(default="bar", description="首选图表类型: bar/line/pie/scatter等")
     preferred_currency: str = Field(default="CNY", description="首选货币单位")

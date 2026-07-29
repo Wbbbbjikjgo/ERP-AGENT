@@ -33,9 +33,9 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-# 预定义模块 logger
-agent_logger = get_logger("agent")
-mcp_logger = get_logger("mcp")
-sandbox_logger = get_logger("sandbox")
-web_logger = get_logger("web")
-middleware_logger = get_logger("middleware")
+# 预定义模块 logger 预定义 5 个模块 logger，各模块按需导入使用
+agent_logger = get_logger("agent")        # Agent 核心逻辑
+mcp_logger = get_logger("mcp")            # MCP 工具相关
+sandbox_logger = get_logger("sandbox")    # 沙箱操作
+web_logger = get_logger("web")            # Web API 层
+middleware_logger = get_logger("middleware")  # 中间件

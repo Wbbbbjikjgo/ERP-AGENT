@@ -194,7 +194,7 @@ load_env()
 **被谁依赖**：`config.py`、`web_config.py`、`server_config.py`、`web_search.py` 等几乎所有需要配置的模块。
 
 **.env 文件内容**：
-```
+```bash
 DASHSCOPE_API_KEY=sk-f99ccd929fe146629c62c7339d3a9e55
 MONGODB_URI=mongodb://localhost:27017
 ERP_BASE_URL=http://47.92.108.163:8081
@@ -491,8 +491,11 @@ class ERPHttpClient:
     - 单例模式（__new__ 重写），全局共享一个连接池
     - 懒初始化（client 属性首次访问时才创建 AsyncClient）
     - 自动过滤 None 参数（避免发送 null 到 Java 后端）
-    """
+  
+        HTTP 客户端采用单例模式，因为其维护昂贵的连接池资源，全局共享可复用 TCP 连接、显著提升性能并统一超时/并发配置；而 LLM 实例不适合单例，因为不同任务需要独立的模型、温度、API Key 等参数配置，且调用本身是无状态的，按需创建更灵活、更经济。
 
+    """
+	#表示这个值可以是某种类型，也可以是 None。 Optional类型注解
     _instance: Optional['ERPHttpClient'] = None
     _client: Optional[httpx.AsyncClient] = None
 
@@ -1030,6 +1033,7 @@ async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
     4. 缓存结果
     5. 失败时指数退避重试
     6. 全部失败时返回空列表（优雅降级）
+    虽然 SSE 本身是服务器到客户端的单向流，但 MCP 巧妙地利用“SSE 流接收 + HTTP POST 发送”的组合实现了双向消息交换。这种设计天然适配 HTTP 基础设施（如代理、负载均衡、防火墙），便于集成认证和监控
     """
     global _cached_tools, _cache_time
 
@@ -1090,6 +1094,8 @@ def load_mcp_tools_sync(force_refresh: bool = False) -> List[BaseTool]:
     处理各种事件循环状态：
     - 无事件循环 → asyncio.run()
     - 有运行中的事件循环 → ThreadPoolExecutor + asyncio.run()
+    在异步事件中必须先创建同步循环
+    在异步上下文中必须使用同步包装器加线程池，核心原因是 Python 的 asyncio.run() 强制要求当前线程没有正在运行的事件循环，否则会直接抛出 RuntimeError；而你的代码可能既会在纯同步脚本中直接运行，也会在 FastAPI 等异步框架的启动阶段被调用，后者已经有一个正在运行的事件循环。为了兼容这两种场景，你的 load_mcp_tools_sync 函数先检测当前线程是否有活跃的事件循环：如果没有，就直接用 asyncio.run() 执行异步协程；如果有，则通过 ThreadPoolExecutor 在新线程中执行 asyncio.run()，因为每个线程可以独立拥有自己的事件循环，从而避免嵌套冲突。这种设计既保证了代码的健壮性和可移植性，又通过线程隔离确保了异步任务的正确执行，是处理"同步包装异步函数"场景的标准做法。
     """
     global _cached_tools, _cache_time
     if not force_refresh and _cached_tools is not None:
@@ -1100,15 +1106,34 @@ def load_mcp_tools_sync(force_refresh: bool = False) -> List[BaseTool]:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-
-    if loop and loop.is_running():
-        # 在异步上下文中（如 FastAPI startup），需要在新线程中运行
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, load_mcp_tools(force_refresh))
-            return future.result(timeout=30)
-    else:
-        return asyncio.run(load_mcp_tools(force_refresh))
+# 检测当前线程是否已经有正在运行的事件循环
+# asyncio.get_running_loop() 在有事件循环时返回它，没有时会抛出 RuntimeError
+if loop and loop.is_running():
+    # 情况1：当前线程已经有事件循环在运行了（比如 FastAPI 启动时）
+    # 此时不能直接调用 asyncio.run()，因为它会尝试创建新的事件循环并报错
+    
+    # 导入线程池模块（通常放在顶部，这里为了演示放在此处）
+    import concurrent.futures
+    
+    # 创建一个线程池，最多同时运行 1 个线程
+    # 使用 with 语句确保线程池用完后自动关闭，释放资源
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        # pool.submit() 将任务提交到线程池中异步执行
+        # 它会在新线程中执行 asyncio.run(load_mcp_tools(force_refresh))
+        # 新线程里没有运行中的事件循环，所以 asyncio.run() 可以安全执行
+        # 这样就避免了"在已有事件循环中再次调用 asyncio.run()"的冲突
+        future = pool.submit(asyncio.run, load_mcp_tools(force_refresh))
+        
+        # future.result() 会阻塞当前线程，等待新线程中的任务执行完毕
+        # timeout=30 表示最多等待 30 秒，超时则抛出 TimeoutError
+        # 返回值就是 load_mcp_tools() 执行完毕后的结果（工具列表）
+        return future.result(timeout=30)
+else:
+    # 情况2：当前线程没有运行中的事件循环（比如直接运行 Python 脚本）
+    # 此时可以安全地调用 asyncio.run()
+    # 它会创建一个新的事件循环，执行 load_mcp_tools()，然后自动关闭循环
+    # 这是最简洁的方式，适合纯同步环境
+    return asyncio.run(load_mcp_tools(force_refresh))
 
 
 def invalidate_cache():
@@ -1249,6 +1274,7 @@ def generate_chart(
 
     # 解析数据
     try:
+        #isinstance 是 Python 的内置函数，用于判断一个对象是否属于某个类型（或类型元组），返回布尔值 True 或 False。
         data_list = json.loads(data) if isinstance(data, str) else data
         if not isinstance(data_list, list) or len(data_list) == 0:
             return "错误: data 必须是非空 JSON 列表"
@@ -1264,6 +1290,8 @@ def generate_chart(
     params = {"chart_type": chart_type, "data": data_list, "title": title,
               "output_path": output_path, "x_field": x_field,
               "y_field": y_field, "series_field": series_field}
+    #os.getpid() 是 Python 的 os 模块中的一个函数，用于获取当前进程的进程 ID（PID）。
+    #生成两个临时文件 一个是存储参数的临时文件 一个是存储临时代码执行的文件主要是存储运行图片的临时文件
     params_path = str(download_dir / f"_params_{os.getpid()}.json")
     script_path = str(download_dir / f"_chart_{os.getpid()}.py")
 
@@ -1271,7 +1299,7 @@ def generate_chart(
         with open(params_path, 'w', encoding='utf-8') as f:
             json.dump(params, f, ensure_ascii=False)
         with open(script_path, 'w', encoding='utf-8') as f:
-            f.write(CHART_SCRIPT)
+            f.write(CHART_SCRIPT)#吧上面的脚本代码写入文件
 
         # 在子进程中执行 matplotlib 绘图（超时 30 秒）
         result = subprocess.run(
@@ -1298,7 +1326,7 @@ def generate_chart(
     except Exception as e:
         return f"图表生成异常: {str(e)}"
     finally:
-        # 清理临时文件
+        # 清理临时文件 清楚临时文件
         for tmp in [params_path, script_path]:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -1418,25 +1446,69 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
     except Exception as e:
         return f"获取失败: {str(e)}"
 
-
-@tool
+@tool  # 装饰器：将这个函数注册为一个 MCP 工具，可被 AI 调用
 def install_skill(url: str, skill_name: str = "") -> str:
     """从 URL 下载并安装 Skill 到本地。"""
+    
+    # ============ 第1部分：确定 Skill 名称 ============
+    
+    # 如果用户没有提供 skill_name，从 URL 中自动提取
     if not skill_name:
+        # 去掉 URL 末尾的斜杠，按 / 分割，取最后一段
+        # 例如: "https://example.com/skills/my_skill.md" → "my_skill.md"
         path_part = url.rstrip("/").split("/")[-1]
+        
+        # 使用正则移除文件扩展名（.md, .txt, .markdown）
+        # re.sub() 替换匹配的内容为空字符串
+        # flags=re.IGNORECASE 表示忽略大小写
+        # 例如: "my_skill.md" → "my_skill"
         skill_name = re.sub(r"\.(md|txt|markdown)$", "", path_part, flags=re.IGNORECASE)
-    skill_name = re.sub(r"[^\w\-]", "_", skill_name)  # 安全化名称
+    
+    # 安全化名称：只保留字母、数字、下划线、连字符，其他字符替换为下划线
+    # re.sub(r"[^\w\-]", "_", skill_name) 表示：非单词字符和连字符 → 替换为 "_"
+    # 例如: "my skill@v1" → "my_skill_v1"
+    skill_name = re.sub(r"[^\w\-]", "_", skill_name)
+    
+    # ============ 第2部分：下载内容 ============
+    
     try:
+        # 发送 HTTP GET 请求下载文件
+        # follow_redirects=True: 自动跟随重定向（如果 URL 跳转）
+        # timeout=20: 20秒超时保护
         response = httpx.get(url, follow_redirects=True, timeout=20)
+        
+        # 检查 HTTP 状态码，200 表示成功
         if response.status_code != 200:
             return f"下载失败: HTTP {response.status_code}"
+        
+        # 获取响应内容（文本格式）
         content = response.text
+        
+        # ============ 第3部分：保存到本地 ============
+        
+        # SKILLS_DIR 是预先定义的目录路径（如 "skills/"）
+        # Path() 创建路径对象，方便操作
         skills_dir = Path(SKILLS_DIR)
+        
+        # 创建目录（如果不存在）
+        # parents=True: 创建所有缺失的父目录
+        # exist_ok=True: 如果目录已存在不报错
         skills_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 构建完整的文件路径：skills_dir + skill_name.md
+        # 例如: "skills/my_skill.md"
         file_path = skills_dir / f"{skill_name}.md"
+        
+        # 将下载的内容写入文件
+        # write_text() 是 pathlib 的方法，自动处理文件打开和关闭
         file_path.write_text(content, encoding="utf-8")
+        
+        # ============ 第4部分：返回成功信息 ============
+        
         return f"✅ Skill 安装成功!\n名称: {skill_name}\n路径: {file_path}"
+        
     except Exception as e:
+        # 捕获所有异常（网络错误、权限错误等）
         return f"安装失败: {str(e)}"
 ```
 
@@ -1457,7 +1529,17 @@ from langgraph.types import interrupt  # ⚡ LangGraph 的中断原语
 from ..log_utils import agent_logger
 
 # 订单必填字段
+# 定义订单必填字段列表
+# 这些字段在创建或更新订单时必须提供，否则数据不完整
+# orderNumber: 订单编号（唯一标识）
+# orderDetail: 订单明细列表（包含具体商品信息）
 ORDER_REQUIRED_FIELDS = ["orderNumber", "orderDetail"]
+
+# 定义订单明细必填字段列表
+# 每个订单明细项必须包含以下三个字段
+# partId: 商品/零件ID（标识具体商品）
+# quantity: 订购数量（必须是正数）
+# unitPrice: 商品单价（必须是正数）
 ORDER_DETAIL_REQUIRED_FIELDS = ["partId", "quantity", "unitPrice"]
 
 
@@ -1476,7 +1558,6 @@ def validate_order_data(data: dict) -> list:
         missing.append("orderDetail (至少需要一条明细)")
     return missing
 
-
 def parse_supplement_text(text: str, current_data: dict) -> dict:
     """解析用户补充的自由文本，提取结构化数据
     
@@ -1485,25 +1566,108 @@ def parse_supplement_text(text: str, current_data: dict) -> dict:
     2. 自由文本：用正则提取关键字段
        例如 "零件ID=5 数量100 单价25.5" → {"orderDetail": [{"partId": 5, ...}]}
     """
+    
+    # ============ 第1步：复制当前数据（避免修改原始数据） ============
+    # 将 current_data 复制一份，作为返回结果的基础
+    # 这样既保留了已有数据，又不会影响外部传入的字典
     result = dict(current_data)
-    # 尝试 JSON 解析
+    
+    # ============ 第2步：尝试 JSON 格式解析 ============
+    # 先尝试把输入文本当作 JSON 字符串解析
+    # 因为用户可能直接粘贴 JSON 格式的数据
     try:
+        # 将 JSON 字符串解析为 Python 字典
+        # 例如: '{"orderNumber": "ORD001", "quantity": 100}' → {"orderNumber": "ORD001", "quantity": 100}
         parsed = json.loads(text)
+        
+        # 检查解析结果是否为字典类型
+        # 只有字典才能和当前数据合并
         if isinstance(parsed, dict):
+            # 将解析出的数据更新到结果中
+            # 如果字段已存在则覆盖，不存在则新增
+            # 例如: result 有 "orderNumber"，parsed 有 "quantity" → 两者合并
             result.update(parsed)
+            # JSON 解析成功，直接返回合并后的结果
             return result
+            
+    # 捕获 JSON 解析错误（非 JSON 格式或格式错误）
     except (json.JSONDecodeError, TypeError):
+        # 解析失败则继续往下执行，尝试自由文本解析
         pass
-    # 正则提取
+    
+    # ============ 第3步：自由文本正则解析 ============
+    # 如果 JSON 解析失败，尝试从自然语言中提取关键信息
+    
+    # ----- 3.1 提取 partId（物料/零件 ID） -----
+    # 正则表达式: r'(?:partId|物料\s*ID|零件\s*ID)[=:\s]*(\d+)'
+    # 解释:
+    #   (?:partId|物料\s*ID|零件\s*ID)  - 匹配关键词（不捕获分组）
+    #     - partId: 英文字段名
+    #     - 物料\s*ID: 中文"物料ID"或"物料 ID"
+    #     - 零件\s*ID: 中文"零件ID"或"零件 ID"
+    #   [=:\s]*  - 匹配分隔符：等号、冒号或空格（0个或多个）
+    #   (\d+)    - 捕获组：匹配1个或多个数字（零件ID的值）
+    # 
+    # 匹配示例:
+    #   "partId=123"      → 匹配 "123"
+    #   "物料ID: 456"     → 匹配 "456"
+    #   "零件 ID 789"     → 匹配 "789"
     part_id_match = re.search(r'(?:partId|物料\s*ID|零件\s*ID)[=:\s]*(\d+)', text, re.IGNORECASE)
+    
     if part_id_match:
+        # 如果匹配到 partId，将其添加到订单明细中
+        # result.setdefault("orderDetail", [{}]) 的含义:
+        #   - 如果 result 中有 "orderDetail" 字段，获取它的值
+        #   - 如果没有，设置默认值为 [{}]（一个包含空字典的列表）
+        # [0] 取列表中的第一个元素（第一个订单明细项）
+        # ["partId"] = int(...) 设置 partId 字段，并转为整数
+        # 
+        # 这样做的目的是：如果 orderDetail 还不存在，自动创建它
         result.setdefault("orderDetail", [{}])[0]["partId"] = int(part_id_match.group(1))
+    
+    # ----- 3.2 提取 quantity（数量） -----
+    # 正则表达式: r'(?:quantity|数量)[=:\s]*(\d+)'
+    # 解释:
+    #   (?:quantity|数量)  - 匹配关键词（不捕获分组）
+    #     - quantity: 英文字段名
+    #     - 数量: 中文字段名
+    #   [=:\s]*  - 匹配分隔符：等号、冒号或空格
+    #   (\d+)    - 捕获组：匹配1个或多个数字（数量的值）
+    #
+    # 匹配示例:
+    #   "quantity=100"    → 匹配 "100"
+    #   "数量: 200"       → 匹配 "200"
     qty_match = re.search(r'(?:quantity|数量)[=:\s]*(\d+)', text, re.IGNORECASE)
+    
     if qty_match:
+        # 将提取的数量添加到订单明细的第一项
+        # 同样，如果 orderDetail 不存在则自动创建
         result.setdefault("orderDetail", [{}])[0]["quantity"] = int(qty_match.group(1))
+    
+    # ----- 3.3 提取 unitPrice（单价） -----
+    # 正则表达式: r'(?:unitPrice|单价)[=:\s]*([\d.]+)'
+    # 解释:
+    #   (?:unitPrice|单价)  - 匹配关键词（不捕获分组）
+    #     - unitPrice: 英文字段名
+    #     - 单价: 中文字段名
+    #   [=:\s]*  - 匹配分隔符：等号、冒号或空格
+    #   ([\d.]+) - 捕获组：匹配数字和点号（支持小数）
+    #     - \d 匹配数字
+    #     - \. 匹配小数点
+    #     - 例如: "25.5"、"100"、"99.99"
+    #
+    # 匹配示例:
+    #   "unitPrice=25.5"  → 匹配 "25.5"
+    #   "单价: 100"       → 匹配 "100"
+    #   "单价 99.99"      → 匹配 "99.99"
     price_match = re.search(r'(?:unitPrice|单价)[=:\s]*([\d.]+)', text, re.IGNORECASE)
+    
     if price_match:
+        # 将提取的单价添加到订单明细的第一项，转为浮点数
         result.setdefault("orderDetail", [{}])[0]["unitPrice"] = float(price_match.group(1))
+    
+    # ============ 第4步：返回处理后的结果 ============
+    # 将合并了提取数据的字典返回给调用者
     return result
 
 
@@ -1586,17 +1750,56 @@ def assign_skill(skill_name: str, agent_name: str = "main") -> str:
     if skill_path is None:
         return f"技能 '{skill_name}' 未找到"
 
-    # 如果目标是子Agent，复制到对应 scope
-    if agent_name != "main":
-        target_dir = SKILLS_BASE_DIR / agent_name / skill_name
-        if not target_dir.exists():
-            target_dir.parent.mkdir(parents=True, exist_ok=True)
-            if skill_path.is_dir():
-                shutil.copytree(skill_path, target_dir)
-            else:
-                shutil.copy2(skill_path, target_dir / skill_path.name)
-            return f"技能 '{skill_name}' 已成功分配给 Agent '{agent_name}'"
-    return f"技能 '{skill_name}' 已在主 Agent 技能库中可用"
+  # ============ 判断是否为子 Agent ============
+# agent_name: Agent 名称（"main" 表示主 Agent，其他名称表示子 Agent）
+# 如果 agent_name != "main"，说明是要将技能分配给特定的子 Agent
+if agent_name != "main":
+    # ============ 构建目标路径 ============
+    # SKILLS_BASE_DIR: 技能库根目录（例如: /app/skills/）
+    # agent_name: 子 Agent 名称（例如: "sales_agent", "tech_support_agent"）
+    # skill_name: 技能名称（例如: "order_processor", "data_analyzer"）
+    # 
+    # target_dir = SKILLS_BASE_DIR / agent_name / skill_name
+    # 例如: /app/skills/sales_agent/order_processor/
+    target_dir = SKILLS_BASE_DIR / agent_name / skill_name
+    
+    # ============ 检查目标目录是否已存在 ============
+    # 如果不存在，才进行复制操作（避免重复复制）
+    if not target_dir.exists():
+        # ============ 创建父目录 ============
+        # target_dir.parent 是 /app/skills/sales_agent/
+        # parents=True: 如果 /app/skills/ 不存在，也会一起创建
+        # exist_ok=True: 如果目录已存在，不报错
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        
+        # ============ 复制技能文件或目录 ============
+        # skill_path: 技能源路径（可能是文件或目录）
+        if skill_path.is_dir():
+            # ---------- 复制整个目录 ----------
+            # 如果 skill_path 是目录（例如: /app/skills/main/order_processor/）
+            # 复制整个目录及其所有子文件到 target_dir
+            # 例如: 复制 /app/skills/main/order_processor/ 
+            #      到 /app/skills/sales_agent/order_processor/
+            shutil.copytree(skill_path, target_dir)
+        else:
+            # ---------- 复制单个文件 ----------
+            # 如果 skill_path 是文件（例如: /app/skills/main/order_processor.py）
+            # 复制该文件到目标目录，保留原文件名
+            # skill_path.name 获取文件名（例如: order_processor.py）
+            # target_dir / skill_path.name 组成完整目标路径
+            # 例如: 复制 /app/skills/main/order_processor.py 
+            #      到 /app/skills/sales_agent/order_processor.py
+            shutil.copy2(skill_path, target_dir / skill_path.name)
+        
+        # ============ 返回成功信息 ============
+        return f"技能 '{skill_name}' 已成功分配给 Agent '{agent_name}'"
+    
+    # 如果目标目录已存在，直接返回（但不进行复制）
+    return f"技能 '{skill_name}' 已存在于 Agent '{agent_name}' 中"
+
+# ============ 主 Agent 的情况 ============
+# 如果 agent_name == "main"，技能已在主 Agent 的技能库中
+return f"技能 '{skill_name}' 已在主 Agent 技能库中可用"
 ```
 
 ---
@@ -1741,41 +1944,141 @@ class DockerSandboxBackend(BaseSandbox):
         if self._client:
             self._client.close()
 
-    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        """从容器中下载文件（通过 base64 编码读取）"""
-        results = []
-        for path in paths:
-            try:
-                resp = self.execute(f"base64 '{path}'")
-                if resp.exit_code == 0 and resp.output.strip():
-                    import base64
-                    content = base64.b64decode(resp.output.strip())
-                    results.append(FileDownloadResponse(path=path, content=content, error=None))
-                else:
-                    results.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
-            except Exception as e:
-                results.append(FileDownloadResponse(path=path, content=None, error=str(e)))
-        return results
+  def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+    """从容器中下载文件（通过 base64 编码读取）
+    
+    工作原理：
+    1. 在容器内执行 base64 命令读取文件
+    2. 将 base64 编码的内容解码为二进制数据
+    3. 返回包含文件内容和元数据的响应对象
+    """
+    # 初始化结果列表，用于存储每个文件的下载结果
+    results = []
+    
+    # 遍历所有需要下载的文件路径
+    for path in paths:
+        try:
+            # ----- 第1步：在容器内执行 base64 编码命令 -----
+            # 在容器中执行 `base64 '/path/to/file'` 命令
+            # base64 命令会将文件内容编码为 ASCII 字符串输出
+            # 例如：base64 '/app/data.txt' → "SGVsbG8gV29ybGQK"
+            resp = self.execute(f"base64 '{path}'")
+            
+            # ----- 第2步：检查执行结果 -----
+            # resp.exit_code == 0 表示命令执行成功
+            # resp.output.strip() 获取去除首尾空白字符的输出内容
+            if resp.exit_code == 0 and resp.output.strip():
+                # 导入 base64 解码模块（已导入则在顶部）
+                import base64
+                
+                # ----- 第3步：解码文件内容 -----
+                # 将 base64 字符串解码为原始的二进制数据
+                # base64.b64decode() 接收字符串参数，返回 bytes 对象
+                # 例如：base64.b64decode("SGVsbG8gV29ybGQK") → b'Hello World\n'
+                content = base64.b64decode(resp.output.strip())
+                
+                # 创建成功响应对象
+                # FileDownloadResponse 包含：path(路径)、content(二进制内容)、error(错误信息)
+                results.append(FileDownloadResponse(path=path, content=content, error=None))
+            else:
+                # 文件不存在或读取失败
+                # 可能是路径错误、权限不足或文件为空
+                results.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
+                
+        except Exception as e:
+            # ----- 第4步：异常处理 -----
+            # 捕获所有可能的异常（如：网络断开、编码错误、权限问题等）
+            # 将异常信息保存到错误字段，不影响其他文件的下载
+            results.append(FileDownloadResponse(path=path, content=None, error=str(e)))
+    
+    # 返回所有文件的下载结果列表
+    return results
 
-    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """上传文件到容器（通过 tar + put_archive）"""
-        import base64, io, tarfile
-        results = []
-        for path, content in files:
-            try:
-                dir_name = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
-                file_name = path.split("/")[-1]
-                tar_stream = io.BytesIO()
-                with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                    info = tarfile.TarInfo(name=file_name)
-                    info.size = len(content)
-                    tar.addfile(info, io.BytesIO(content))
-                tar_stream.seek(0)
-                self._container.put_archive(dir_name, tar_stream.read())
-                results.append(FileUploadResponse(path=path, error=None))
-            except Exception as e:
-                results.append(FileUploadResponse(path=path, error=str(e)))
-        return results
+
+def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+    """上传文件到容器（通过 tar + put_archive）
+    
+    工作原理：
+    1. 将每个文件打包成一个独立的 tar 归档
+    2. 使用 Docker SDK 的 put_archive 方法将归档上传到容器
+    3. 容器会自动解压 tar 包到指定目录
+    """
+    # 导入需要的模块
+    import base64, io, tarfile
+    
+    # 初始化结果列表
+    results = []
+    
+    # 遍历文件列表，每个元素是 (目标路径, 二进制内容) 的元组
+    for path, content in files:
+        try:
+            # ----- 第1步：解析目标路径 -----
+            # 获取文件所在的目录路径
+            # path.rstrip("/") 移除末尾斜杠
+            # .split("/") 按斜杠分割
+            # [:-1] 取除最后一个部分（文件名）外的所有部分
+            # "/".join(...) 重新组合成目录路径
+            # 如果结果是空字符串，则使用 "/"（根目录）
+            # 
+            # 示例1：path = "/app/data/config.json"
+            #   → path.rstrip("/") = "/app/data/config.json"
+            #   → .split("/") = ["", "app", "data", "config.json"]
+            #   → [:-1] = ["", "app", "data"]
+            #   → "/".join(...) = "/app/data"
+            # 
+            # 示例2：path = "config.json"
+            #   → 结果为 "/"
+            dir_name = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+            
+            # 获取文件名（路径的最后一部分）
+            # 示例：path = "/app/data/config.json" → "config.json"
+            file_name = path.split("/")[-1]
+            
+            # ----- 第2步：创建 tar 归档（内存中） -----
+            # io.BytesIO() 创建内存中的字节流缓冲区
+            tar_stream = io.BytesIO()
+            
+            # 以写模式打开 tar 文件对象
+            # fileobj=tar_stream 表示写入到内存流，而非磁盘文件
+            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+                # 创建 tar 文件的元数据信息
+                # TarInfo 包含文件名、权限、大小、修改时间等
+                info = tarfile.TarInfo(name=file_name)
+                
+                # 设置文件大小（必须与后续内容匹配）
+                info.size = len(content)
+                
+                # 将文件添加到 tar 包中
+                # 参数1：文件元数据信息
+                # 参数2：文件内容的二进制流对象
+                # io.BytesIO(content) 将 bytes 包装成文件对象
+                tar.addfile(info, io.BytesIO(content))
+            # 退出 with 块时 tar 文件对象已关闭，但 tar_stream 仍有效
+            
+            # ----- 第3步：准备上传数据 -----
+            # 将内存流的指针移到开头（否则读不到数据）
+            tar_stream.seek(0)
+            
+            # ----- 第4步：上传 tar 包到容器 -----
+            # self._container 是 Docker SDK 的 Container 对象
+            # put_archive(目标目录, tar数据) 方法：
+            #   - 将 tar 数据上传到容器的指定目录
+            #   - 容器会自动解压 tar 包到该目录
+            # 
+            # 示例：dir_name="/app/data"，tar包内包含 "config.json"
+            #   → 上传后容器内生成 /app/data/config.json
+            self._container.put_archive(dir_name, tar_stream.read())
+            
+            # ----- 第5步：记录成功结果 -----
+            results.append(FileUploadResponse(path=path, error=None))
+            
+        except Exception as e:
+            # ----- 第6步：异常处理 -----
+            # 捕获所有可能的异常（如：目录不存在、权限不足、磁盘空间满等）
+            results.append(FileUploadResponse(path=path, error=str(e)))
+    
+    # 返回所有文件的上传结果
+    return results
 ```
 
 ---
@@ -1804,10 +2107,15 @@ def create_and_setup_sandbox(user_id: str = "default") -> CustomOpenSandbox:
 沙箱生命周期管理
 五态：预热池 → 认领 → MongoDB缓存 → 新建 → 销毁
 """
+# 导入类型注解，用于声明字典的值类型
 from typing import Dict, Optional
+# 导入自定义沙箱类（这里存在导入问题，稍后说明）
 from .custom_opensandbox import CustomOpenSandbox
+# 导入沙箱创建和初始化函数
 from .sandbox_setup import create_and_setup_sandbox
+# 导入日志工具
 from ..log_utils import sandbox_logger
+
 
 class SandboxManager:
     """沙箱生命周期管理器（单例）
@@ -1816,46 +2124,139 @@ class SandboxManager:
     - user_id → sandbox 映射（每个用户一个独立沙箱）
     - 沙箱不可达时自动重建
     """
+    
+    # ============ 单例模式实现 ============
+    # _instance 是类变量（属于类本身，不属于实例）
+    # 用于存储唯一的实例对象，初始为 None
+    # 所有通过 SandboxManager() 创建的对象共享这个变量
     _instance = None
+    
     def __new__(cls):
+        """__new__ 是 Python 创建实例的第一步（在 __init__ 之前调用）
+        
+        单例模式的核心逻辑：
+        1. 检查类变量 _instance 是否已经存在实例
+        2. 如果不存在，调用父类的 __new__ 创建新实例并保存到 _instance
+        3. 如果已存在，直接返回保存的实例
+        4. 这样无论调用多少次 SandboxManager()，都返回同一个对象
+        
+        cls._instance 的作用：
+        - 存储唯一的实例对象
+        - 是类级别的变量，所有实例共享
+        - 用于判断是否已经创建过实例
+        """
         if cls._instance is None:
+            # 第一次调用：调用父类 object.__new__ 创建实例
+            # super().__new__(cls) 会分配内存并创建对象
             cls._instance = super().__new__(cls)
+            # 为新实例添加 _initialized 标记，表示还未初始化
             cls._instance._initialized = False
+        # 后续调用：直接返回已保存的实例
         return cls._instance
 
     def __init__(self):
-        if self._initialized: return
+        """__init__ 在 __new__ 之后调用，用于初始化实例属性
+        
+        由于单例模式，__init__ 可能会被调用多次（每次调用 SandboxManager() 时）
+        但通过 _initialized 标记，确保只初始化一次
+        """
+        # 检查是否已经初始化过
+        if self._initialized:
+            # 已初始化则直接返回，避免重复初始化
+            return
+        
+        # 标记为已初始化，防止后续重复执行
         self._initialized = True
+        
+        # _user_sandboxes: 存储用户ID到沙箱实例的映射
+        # 格式：{"user123": CustomOpenSandbox实例, "user456": CustomOpenSandbox实例}
+        # 每个用户拥有独立的沙箱，互不干扰
         self._user_sandboxes: Dict[str, CustomOpenSandbox] = {}
+        
+        # _warm_pool: 预热池，存储预先创建好的沙箱实例（五态中的"预热池"）
+        # 预留扩展：可以预先创建沙箱，加快获取速度
         self._warm_pool: list = []
 
     def get_sandbox(self, user_id: str) -> CustomOpenSandbox:
-        """获取用户的沙箱实例（不存在则创建）"""
+        """获取用户的沙箱实例（不存在则创建）
+        
+        工作流程：
+        1. 检查用户是否已有沙箱
+        2. 如果有，检查沙箱是否健康
+        3. 如果健康，直接返回
+        4. 如果不健康，删除旧实例，重新创建
+        5. 如果没有，创建新的沙箱
+        """
+        # 检查用户是否已经有沙箱实例
         if user_id in self._user_sandboxes:
+            # 从字典中获取该用户的沙箱
             sandbox = self._user_sandboxes[user_id]
+            
+            # ping() 方法检查沙箱是否健康（容器是否在运行）
             if sandbox.ping():
+                # 沙箱健康，直接返回
                 return sandbox
             else:
+                # 沙箱不健康（容器意外停止了），记录警告日志
                 sandbox_logger.warning(f"Sandbox unhealthy for user {user_id}, rebuilding...")
+                # 从字典中删除不健康的沙箱实例
+                # 释放内存，等待垃圾回收
                 del self._user_sandboxes[user_id]
+        
+        # 执行到这里，说明用户没有沙箱或沙箱不健康
+        # 调用创建函数新建沙箱（包含环境初始化）
         sandbox = create_and_setup_sandbox(user_id)
+        
+        # 将新建的沙箱存入字典，以便下次快速获取
         self._user_sandboxes[user_id] = sandbox
+        
+        # 返回新建的沙箱
         return sandbox
 
     def rebuild(self, user_id: str = "default_user") -> CustomOpenSandbox:
-        """重建用户沙箱"""
+        """重建用户沙箱
+        
+        使用场景：
+        - 用户报告沙箱异常
+        - 需要清空沙箱数据
+        - 切换用户环境
+        """
+        # 检查用户是否有沙箱
         if user_id in self._user_sandboxes:
-            try: self._user_sandboxes[user_id].destroy()
-            except Exception: pass
+            try:
+                # 尝试销毁旧沙箱（释放容器连接等资源）
+                # destroy() 方法会关闭连接，但不销毁Docker容器
+                self._user_sandboxes[user_id].destroy()
+            except Exception:
+                # 销毁过程出现异常（如容器已不存在），忽略错误继续
+                pass
+            # 从字典中删除旧沙箱引用
             del self._user_sandboxes[user_id]
+        
+        # 调用 get_sandbox 创建新的沙箱（会自动调用 create_and_setup_sandbox）
         return self.get_sandbox(user_id)
 
     def destroy_user_sandbox(self, user_id: str):
+        """销毁指定用户的沙箱
+        
+        使用场景：
+        - 用户退出登录
+        - 清理空闲沙箱
+        - 节省资源
+        """
+        # 检查用户是否有沙箱
         if user_id in self._user_sandboxes:
+            # 调用沙箱的 destroy 方法释放资源
             self._user_sandboxes[user_id].destroy()
+            # 从字典中删除引用
             del self._user_sandboxes[user_id]
 
-sandbox_manager = SandboxManager()  # 全局单例
+
+# ============ 创建全局单例实例 ============
+# 模块加载时立即创建 SandboxManager 实例
+# 由于单例模式，无论在哪里导入 sandbox_manager，都是同一个对象
+# 所有模块共享同一个沙箱管理器，保证一致性
+sandbox_manager = SandboxManager()
 ```
 
 ---
@@ -2053,72 +2454,168 @@ class ContextInjectionMiddleware(AgentMiddleware):
 ### 6.3 `skills_sync.py` — 技能增量同步（91行）
 
 ```python
-"""中间件 3: 本地技能同步到沙箱（hash 比对增量同步）"""
-import hashlib
-from pathlib import Path
+"""
+中间件 3: 本地技能同步到沙箱（hash 比对增量同步）
+"""
+import hashlib  # 导入哈希库，用于计算文件 MD5 值
+from pathlib import Path  # 导入路径库，用于处理文件路径
 from langchain.agents.middleware import AgentMiddleware, Runtime
+
 
 class SkillsSyncMiddleware(AgentMiddleware):
     """首次执行时将本地 src/skills/ 同步到沙箱 /skills/"""
+    
     def __init__(self, skills_dir=None, sandbox_backend=None):
+        # 技能目录路径（本地源目录）
         self._skills_dir = Path(skills_dir) if skills_dir else None
+        # 沙箱后端实例（用于写入文件到沙箱）
         self._sandbox_backend = sandbox_backend
+        # 文件哈希缓存：{文件名: MD5值}，用于增量同步判断
         self._file_hashes: dict = {}
+        # 同步标记：是否已完成同步
         self._synced = False
+        # 工具列表（LangChain 中间件要求）
         self.tools = []
 
     def before_agent(self, state, runtime):
-        if self._synced: return None
+        """Agent 执行前调用：首次执行时同步技能文件"""
+        
+        # 如果已经同步过，跳过
+        if self._synced:
+            return None
+        
+        # 如果技能目录存在
         if self._skills_dir and self._skills_dir.exists():
+            # 判断是生产模式（有沙箱后端）还是开发模式（无沙箱后端）
             if self._sandbox_backend:
-                self._sync_to_sandbox()  # 生产模式：同步到沙箱
+                # 生产模式：同步到沙箱
+                self._sync_to_sandbox()
             else:
-                self._validate_local_skills()  # 开发模式：仅校验
+                # 开发模式：仅校验本地文件，不实际同步
+                self._validate_local_skills()
+        
+        # 标记为已同步（后续请求不再重复同步）
         self._synced = True
         return None
 
     def _sync_to_sandbox(self):
         """增量同步：只传输 hash 变更的文件"""
+        
+        # 遍历技能目录下的所有文件
         for file_path in self._skills_dir.rglob("*"):
+            # 只处理 .md 和 .py 文件（技能定义和脚本）
             if file_path.is_file() and file_path.suffix in (".md", ".py"):
+                
+                # 计算当前文件的 MD5 哈希值
                 file_hash = hashlib.md5(file_path.read_bytes()).hexdigest()
+                
+                # 检查缓存中的哈希值是否一致
+                # ❌ 问题：用 file_path.name（仅文件名）作为 key
+                # 如果有两个同名的文件在不同子目录，会互相覆盖
                 if self._file_hashes.get(str(file_path.name)) != file_hash:
+                    
+                    # 读取文件内容
                     content = file_path.read_text(encoding="utf-8")
+                    
+                    # 写入沙箱
+                    # ❌ 问题：只写文件名，丢失了目录结构
+                    # 例如：src/skills/subfolder/tool.py → /skills/tool.py
+                    # 子目录结构丢失！
                     self._sandbox_backend.write_file(f"/skills/{file_path.name}", content)
+                    
+                    # 更新缓存中的哈希值
                     self._file_hashes[str(file_path.name)] = file_hash
 ```
 
 ### 6.4 `user_skills_restore.py` — 持久化技能恢复（73行）
 
 ```python
-"""中间件 4: 从 StoreBackend 恢复用户持久化的自定义技能到沙箱"""
+"""
+中间件 4: 持久化技能恢复
+从 StoreBackend 恢复用户持久化的自定义技能到沙箱
+"""
+from typing import Any
+
 from langchain.agents.middleware import AgentMiddleware, Runtime
+from ..log_utils import middleware_logger
+
 
 class UserSkillsRestoreMiddleware(AgentMiddleware):
-    """Agent 启动时从 Store 恢复跨会话持久化的技能"""
-    def __init__(self, store=None, user_id="default_user", sandbox_backend=None):
+    """
+    持久化技能恢复中间件
+
+    职责：
+    - Agent 启动时从 StoreBackend (/persisted-skills/) 读取用户自定义技能
+    - 将技能文件恢复到沙箱 /skills/ 目录
+    - 确保跨会话技能持久性（用户通过 assign_skill 安装的技能不会丢失）
+
+    工作流程：
+    1. store.aget(namespace=("persisted-skills", user_id)) → 技能清单
+    2. 逐个读取技能内容 → 写入沙箱
+    3. 记录恢复结果
+    """
+
+    def __init__(self, store=None, user_id: str = "default_user", sandbox_backend=None):
+        # StoreBackend 实例：负责读取持久化存储中的技能数据
         self._store = store
+        # 用户ID：用于隔离不同用户的技能
         self._user_id = user_id
+        # 沙箱后端实例：用于将技能写入沙箱文件系统
         self._sandbox_backend = sandbox_backend
+        # 恢复标记：防止重复恢复
         self._restored = False
         self.tools = []
 
-    def before_agent(self, state, runtime):
-        if self._restored: return None
-        if self._store and self._sandbox_backend:
+    @property
+    def name(self) -> str:
+        return "UserSkillsRestoreMiddleware"
+
+    def before_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
+        """首次执行时恢复持久化技能"""
+        # 如果已经恢复过，跳过
+        if self._restored:
+            return None
+
+        # 如果 store 和 sandbox_backend 都存在，执行恢复
+        if self._store is not None and self._sandbox_backend is not None:
             self._restore_skills()
+
+        # 标记为已恢复
         self._restored = True
         return None
 
     def _restore_skills(self):
-        """从 Store 获取技能索引 → 逐个写入沙箱"""
-        namespace = ("persisted-skills", self._user_id)
-        items = self._store.search(namespace)
-        for item in items:
-            skill_content = item.value.get("content", "")
-            skill_path = item.value.get("path", f"/skills/custom/{item.key}")
-            if skill_content:
-                self._sandbox_backend.write_file(skill_path, skill_content)
+        """从 Store 恢复技能到沙箱"""
+        try:
+            import asyncio
+            # 构建命名空间：("persisted-skills", user_id)
+            # 用于隔离不同用户的技能数据
+            namespace = ("persisted-skills", self._user_id)
+            
+            # 从 store 搜索该命名空间下的所有技能
+            # ❌ 问题1: search() 可能不存在或参数不对
+            items = self._store.search(namespace)
+            restored_count = 0
+
+            for item in items:
+                # ❌ 问题2: item.key 和 item.value 的访问方式不确定
+                skill_name = item.key
+                skill_content = item.value.get("content", "")
+                skill_path = item.value.get("path", f"/skills/custom/{skill_name}")
+
+                if skill_content:
+                    # ❌ 问题3: 没有创建父目录，write_file 可能失败
+                    # ❌ 问题4: 没有处理文件覆盖/冲突问题
+                    self._sandbox_backend.write_file(skill_path, skill_content)
+                    restored_count += 1
+
+            if restored_count > 0:
+                middleware_logger.info(
+                    f"Restored {restored_count} persisted skills for user {self._user_id}"
+                )
+        except Exception as e:
+            # ❌ 问题5: 异常被吞掉，只记录warning，上层不知道恢复失败
+            middleware_logger.warning(f"Skills restore failed (non-critical): {e}")
 ```
 
 ### 6.5 `tools_summarization.py` — 摘要监控（48行）
@@ -2142,104 +2639,233 @@ class ToolsSummarizationMiddleware(AgentMiddleware):
 ### 6.6 `memory_update.py` — 偏好自动提取（98行）
 
 ```python
-"""中间件 6: 对话结束后从消息中提取用户偏好 → store.aput() 持久化"""
+"""
+中间件 6: 对话结束后从消息中提取用户偏好 → store.aput() 持久化
+"""
 from langchain.agents.middleware import AgentMiddleware, Runtime
+
 
 class MemoryUpdateMiddleware(AgentMiddleware):
     """
     after_agent: 从最近对话中提取用户偏好信号
+    
     提取规则（基于关键词匹配，无需额外 LLM 调用）：
     - "以后都用饼图" → preferred_chart_type = "pie"
     - "用表格展示" → preferred_output = "table"
+    
+    工作原理：
+    1. Agent 执行完成后，截取最近 3 条用户消息
+    2. 用关键词匹配提取图表类型和输出格式偏好
+    3. 将提取到的偏好持久化到 Store（跨会话保存）
     """
+    
+    # 图表类型关键词映射表
+    # 用户说"饼图" → 存储为 "pie"
     CHART_KEYWORDS = {
-        "饼图": "pie", "柱状图": "bar", "折线图": "line",
-        "散点图": "scatter", "雷达图": "radar", "环形图": "donut",
+        "饼图": "pie", 
+        "柱状图": "bar", 
+        "折线图": "line",
+        "散点图": "scatter", 
+        "雷达图": "radar", 
+        "环形图": "donut",
     }
+    
+    # 输出格式关键词映射表
     OUTPUT_KEYWORDS = {
-        "表格": "table", "json": "json", "markdown": "markdown",
+        "表格": "table", 
+        "json": "json", 
+        "markdown": "markdown",
     }
 
     def __init__(self, store=None, user_id="default_user"):
+        """
+        初始化中间件
+        
+        Args:
+            store: StoreBackend 实例（用于持久化用户偏好）
+            user_id: 用户ID（用于隔离不同用户的偏好数据）
+        """
         self._store = store
         self._user_id = user_id
-        self.tools = []
+        self.tools = []  # LangChain 中间件要求
 
     def after_agent(self, state, runtime):
-        """Agent 执行后提取并持久化用户偏好"""
-        if not self._store: return None
+        """
+        Agent 执行完成后调用：提取并持久化用户偏好
+        
+        执行流程：
+        1. 检查 store 是否可用
+        2. 从 state 中获取最近 10 条消息
+        3. 过滤出最近 3 条用户消息
+        4. 用关键词匹配提取偏好
+        5. 如果有新偏好，持久化到 Store
+        """
+        # 如果没有 store，跳过（开发模式）
+        if not self._store:
+            return None
+        
+        # 从 state 中获取消息列表
+        # state 可能是 dict 或对象，兼容处理
         messages = state.get("messages", []) if isinstance(state, dict) else []
-        user_messages = [m for m in messages[-10:] if hasattr(m, "type") and m.type == "human"][-3:]
+        
+        # 过滤出用户消息（最近 10 条中的后 3 条）
+        # 只取用户发的消息，不包括 AI 回复
+        user_messages = [
+            m for m in messages[-10:] 
+            if hasattr(m, "type") and m.type == "human"
+        ][-3:]  # 取最近 3 条
+        
+        # 存储提取到的偏好（增量更新）
         preferences_updates = {}
+        
+        # 遍历用户消息，提取偏好
         for msg in user_messages:
+            # 获取消息内容（兼容不同的消息对象格式）
             content = msg.content if hasattr(msg, "content") else str(msg)
-            if not isinstance(content, str): continue
-            # 提取图表偏好
+            if not isinstance(content, str):
+                continue
+            
+            # ----- 提取图表类型偏好 -----
+            # 匹配规则：关键词 + "以后"/"默认" 出现在同一句话中
+            # 例如："以后都用饼图" → 匹配到 "饼图" 和 "以后"
             for keyword, chart_type in self.CHART_KEYWORDS.items():
                 if keyword in content and ("以后" in content or "默认" in content):
                     preferences_updates["preferred_chart_type"] = chart_type
-            # 提取输出格式偏好
+            
+            # ----- 提取输出格式偏好 -----
+            # 匹配规则：关键词 + "用"/"格式" 出现在同一句话中
+            # 例如："用表格展示" → 匹配到 "表格" 和 "用"
             for keyword, output_fmt in self.OUTPUT_KEYWORDS.items():
                 if keyword in content and ("用" in content or "格式" in content):
                     preferences_updates["preferred_output"] = output_fmt
-        # 持久化到 Store
+        
+        # 如果有提取到新的偏好，持久化到 Store
         if preferences_updates:
+            # 命名空间：("user-preferences", user_id) 隔离不同用户
             namespace = ("user-preferences", self._user_id)
+            # 存储键值对：key="preferences", value=偏好字典
+            # ❌ 问题：这里是同步 put，但 Store 接口通常是异步的 aput
             self._store.put(namespace, key="preferences", value=preferences_updates)
+        
+        # 返回 None 表示不修改 state
+        return None
 ```
 
 ### 6.7 `sandbox_breaker.py` — 三态熔断器（121行）
 
 ```python
-"""中间件 7: 沙箱熔断器
+"""
+中间件 7: 沙箱熔断器
 三态模型：CLOSED(正常) → OPEN(熔断) → HALF_OPEN(探测) → CLOSED
+
+工作原理：
+- CLOSED（闭合）：正常调用，失败计数
+- OPEN（断开）：直接拦截，不调用沙箱
+- HALF_OPEN（半开）：允许单次调用探测，成功则恢复，失败则重回 OPEN
 """
 import time
 from langchain_core.messages import ToolMessage
 from langchain.agents.middleware import AgentMiddleware, Runtime, ToolCallRequest
+
 
 class SandboxCircuitBreakerMiddleware(AgentMiddleware):
     """
     连续 N 次沙箱工具调用失败 → 短路 → 降级响应
     仅拦截沙箱工具（execute, run_code 等），MCP/ERP 工具不受影响
     """
+    
+    # 需要熔断保护的沙箱工具名称集合
+    # 这些工具依赖沙箱环境，容易因容器问题失败
     SANDBOX_TOOLS = {"execute", "run_code", "run_python", "shell", "bash"}
 
     def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 60.0):
+        """
+        初始化熔断器
+        
+        Args:
+            failure_threshold: 连续失败多少次后触发熔断（默认3次）
+            recovery_timeout: 熔断后等待多少秒尝试恢复（默认60秒）
+        """
+        # 连续失败次数阈值
         self._failure_threshold = failure_threshold
+        # 熔断恢复等待时间（秒）
         self._recovery_timeout = recovery_timeout
+        # 当前连续失败计数
         self._failure_count = 0
-        self._state = "CLOSED"  # CLOSED / OPEN / HALF_OPEN
+        # 熔断器状态：CLOSED（闭合正常）/ OPEN（断开熔断）/ HALF_OPEN（半开探测）
+        self._state = "CLOSED"
+        # 最后一次失败的时间戳（用于计算恢复超时）
         self._last_failure_time = 0
+        # 中间件工具列表（LangChain 要求）
         self.tools = []
 
     async def awrap_tool_call(self, request, handler):
-        """拦截沙箱工具调用，实现熔断逻辑"""
+        """
+        拦截沙箱工具调用，实现熔断逻辑
+        
+        这是 LangChain 中间件的核心方法，在工具调用前后执行。
+        
+        Args:
+            request: 工具调用请求（包含工具名、参数等）
+            handler: 下一个处理器（最终会执行实际工具）
+        
+        Returns:
+            工具调用结果或降级响应
+        """
+        # 获取工具名称
         tool_name = request.tool_call.get("name", "")
+        
+        # ----- 非沙箱工具直接放行 -----
+        # 只拦截沙箱工具，MCP/ERP 工具不受熔断影响
         if tool_name.lower() not in self.SANDBOX_TOOLS:
-            return await handler(request)  # 非沙箱工具直接通过
+            return await handler(request)
 
+        # ============ 熔断器状态机 ============
+        
+        # ----- 状态：OPEN（熔断中） -----
         if self._state == "OPEN":
+            # 检查是否已达到恢复超时时间
             if time.time() - self._last_failure_time >= self._recovery_timeout:
-                self._state = "HALF_OPEN"  # 超时 → 试探恢复
+                # 超时 → 进入半开状态，允许一次试探性调用
+                self._state = "HALF_OPEN"
             else:
-                return ToolMessage(  # 直接返回降级响应
+                # 熔断中 → 直接返回降级响应，不调用沙箱
+                # 这可以快速失败，避免等待超时
+                return ToolMessage(
                     content=f"[沙箱暂时不可用] 工具 '{tool_name}' 被熔断器拦截。",
-                    tool_call_id=request.tool_call.get("id", ""), status="error",
+                    tool_call_id=request.tool_call.get("id", ""),
+                    status="error",
                 )
+        
+        # ----- 尝试调用沙箱工具 -----
         try:
+            # 执行实际的工具调用
             result = await handler(request)
+            
+            # ---- 调用成功 ----
+            # 重置失败计数
             self._failure_count = 0
-            self._state = "CLOSED"  # 成功 → 重置
+            # 恢复为闭合状态（正常）
+            self._state = "CLOSED"
             return result
+            
         except Exception as e:
+            # ---- 调用失败 ----
+            # 增加失败计数
             self._failure_count += 1
+            # 记录失败时间
             self._last_failure_time = time.time()
+            
+            # 检查是否达到熔断阈值
             if self._failure_count >= self._failure_threshold:
-                self._state = "OPEN"  # 连续失败 → 熔断
+                # 连续失败达到阈值 → 进入熔断状态
+                self._state = "OPEN"
+            
+            # 返回错误信息（不抛出异常，让流程继续）
             return ToolMessage(
                 content=f"[沙箱调用失败] {tool_name}: {str(e)[:200]}",
-                tool_call_id=request.tool_call.get("id", ""), status="error",
+                tool_call_id=request.tool_call.get("id", ""),
+                status="error",
             )
 ```
 
@@ -2355,92 +2981,218 @@ system_prompt: |
 3. 解析 interrupt_on 配置
 4. 将 context_protocol 注入到主Agent系统提示词
 """
-import yaml
-from deepagents import SubAgent
-from langchain_core.tools import BaseTool
-from ..log_utils import agent_logger
+import yaml  # 导入 YAML 解析库，用于读取 .yaml 配置文件
+from pathlib import Path  # 导入路径库，用于处理文件路径
+from deepagents import SubAgent  # 导入子Agent类型（用于类型注解）
+from langchain_core.tools import BaseTool  # 导入工具基类，用于类型注解
+from ..log_utils import agent_logger  # 导入日志工具
 
+# 配置文件目录：当前文件所在目录下的 configs 文件夹
 CONFIGS_DIR = Path(__file__).parent / "configs"
+# 子Agent配置的必填字段列表
+# 每个子Agent配置文件必须包含这些字段
 REQUIRED_FIELDS = ["name", "description", "system_prompt", "tools"]
 
 
 def _validate_subagent_config(config: dict) -> bool:
-    """校验子Agent配置必填字段"""
+    """校验子Agent配置必填字段
+    
+    检查配置字典是否包含所有必填字段，且字段值不为空
+    
+    Args:
+        config: 从 YAML 文件加载的配置字典
+    
+    Returns:
+        True 表示校验通过，False 表示校验失败
+    """
+    # 使用 all() 检查每个必填字段是否都存在且非空
+    # config[field] 在字段存在且值非空时返回 True
     return all(field in config and config[field] for field in REQUIRED_FIELDS)
 
 
 def _parse_interrupt_on(config: dict) -> dict | None:
-    """解析 YAML 中的 interrupt_on 配置为框架格式"""
+    """解析 YAML 中的 interrupt_on 配置为框架格式
+    
+    interrupt_on 用于配置人工审批流程：
+    当子Agent调用某些工具时，需要等待人工审批才能继续
+    
+    YAML 格式示例：
+    interrupt_on:
+      delete_record:
+        allowed_decisions: ["approve", "reject"]
+        description: "删除记录需要管理员审批"
+    
+    Args:
+        config: 子Agent配置字典
+    
+    Returns:
+        解析后的 interrupt_on 字典，如果没有配置则返回 None
+    """
+    # 从配置中获取 interrupt_on 字段（可能不存在）
     raw = config.get("interrupt_on")
-    if not raw: return None
+    
+    # 如果没有配置，直接返回 None
+    if not raw:
+        return None
+    
+    # 解析后的结果字典
     parsed = {}
+    
+    # 遍历每个工具名称及其配置
     for tool_name, tool_config in raw.items():
+        # 检查工具配置是否为字典格式
         if isinstance(tool_config, dict):
+            # 构建框架需要的格式
             parsed[tool_name] = {
+                # 允许的决策列表（默认 approve 和 reject）
                 "allowed_decisions": tool_config.get("allowed_decisions", ["approve", "reject"]),
             }
+            # 如果配置中有描述，也一并添加
             if "description" in tool_config:
                 parsed[tool_name]["description"] = tool_config["description"]
+    
     return parsed
 
 
 def load_subagent_configs() -> list[dict]:
-    """读取 configs/*.yaml，校验必填字段"""
-    configs = []
+    """读取 configs/*.yaml，校验必填字段
+    
+    扫描配置目录下的所有 YAML 文件，加载并校验配置
+    
+    Returns:
+        通过校验的配置列表（未通过校验的会被跳过并记录日志）
+    """
+    configs = []  # 存储通过校验的配置
+    
+    # 遍历 configs 目录下所有 .yaml 文件（按文件名排序）
     for yaml_file in sorted(CONFIGS_DIR.glob("*.yaml")):
-        with open(yaml_file, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+        try:
+            # 打开并读取 YAML 文件
+            with open(yaml_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)  # 安全加载 YAML 内容
+        except Exception as e:
+            # 读取或解析失败，记录错误日志并跳过该文件
+            agent_logger.error(f"Failed to load {yaml_file}: {e}")
+            continue
+        
+        # 校验配置是否包含所有必填字段
         if config and _validate_subagent_config(config):
+            # 校验通过，添加到结果列表
             configs.append(config)
+            agent_logger.info(f"Loaded subagent config: {config['name']}")
+        else:
+            # 校验失败，记录警告日志
+            agent_logger.warning(f"Invalid config in {yaml_file}: missing required fields")
+    
+    # 返回所有通过校验的配置
     return configs
 
 
 def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> list:
     """将 tools 字符串通过子串匹配映射为实际工具对象
     
-    匹配规则：pattern in tool.name
+    匹配规则：pattern in tool.name（子串包含匹配）
     例如："supplier" 会匹配 "supplier_query", "supplier_page", "supplier_get"
+    
+    这种设计允许用户在配置文件中只写 "supplier"，就能自动匹配所有相关工具
+    
+    Args:
+        configs: 子Agent配置列表（来自 load_subagent_configs）
+        all_tools: 所有可用工具的完整列表
+    
+    Returns:
+        包含工具对象解析结果的子Agent规格列表（可直接用于创建 SubAgent）
     """
-    subagents = []
+    subagents = []  # 存储解析后的子Agent规格
+    
+    # 遍历每个子Agent配置
     for config in configs:
+        # 获取配置中的工具模式列表（字符串列表）
         tool_patterns = config.get("tools", [])
+        
+        # 存储匹配到的实际工具对象
         matched_tools = []
+        
+        # 遍历每个工具模式字符串
         for pattern in tool_patterns:
+            # 遍历所有可用工具
             for tool in all_tools:
+                # 检查模式字符串是否包含在工具名称中（子串匹配）
+                # 且该工具尚未被添加（避免重复）
                 if pattern in tool.name and tool not in matched_tools:
                     matched_tools.append(tool)
+        
+        # 解析 interrupt_on 配置
         interrupt_on = _parse_interrupt_on(config)
+        
+        # 构建子Agent规格字典
         subagent_spec = {
-            "name": config["name"],
-            "description": config["description"],
-            "system_prompt": config["system_prompt"],
-            "tools": matched_tools,
+            "name": config["name"],  # 子Agent名称
+            "description": config["description"],  # 子Agent描述
+            "system_prompt": config["system_prompt"],  # 系统提示词
+            "tools": matched_tools,  # 匹配到的实际工具对象
         }
+        
+        # 如果有 interrupt_on 配置，添加到规格中
         if interrupt_on:
             subagent_spec["interrupt_on"] = interrupt_on
+        
+        # 添加到结果列表
         subagents.append(subagent_spec)
+    
     return subagents
 
 
 def get_delegation_context_prompt(configs: list[dict]) -> str:
     """生成主Agent的委派上下文提示词片段
     
-    告诉主Agent在委派任务时应该传递哪些上下文信息
+    告诉主Agent在委派任务给子Agent时，应该传递哪些上下文信息。
+    这个提示词会被注入到主Agent的系统提示词中。
+    
+    Args:
+        configs: 子Agent配置列表
+    
+    Returns:
+        格式化的上下文协议提示词字符串
     """
-    sections = []
+    sections = []  # 存储每个子Agent的协议说明
+    
+    # 遍历每个子Agent配置
     for config in configs:
+        # 获取 context_protocol 配置
         protocol = config.get("context_protocol")
-        if not protocol: continue
+        
+        # 如果没有配置上下文协议，跳过该子Agent
+        if not protocol:
+            continue
+        
+        # 获取输入上下文字段列表
         input_ctx = protocol.get("input_context", [])
+        
+        # 构建该子Agent的协议说明行
         lines = [f"\n### 委派给 {config['name']} 时的上下文传递要求"]
+        
+        # 遍历每个上下文字段定义
         for field_def in input_ctx:
-            field = field_def.get("field", "")
-            desc = field_def.get("description", "")
-            required = field_def.get("required", False)
+            field = field_def.get("field", "")  # 字段名
+            desc = field_def.get("description", "")  # 字段描述
+            required = field_def.get("required", False)  # 是否必填
+            
+            # 根据是否必填添加标记
             marker = "**[必填]**" if required else "[可选]"
+            
+            # 添加字段说明行
             lines.append(f"- {marker} `{field}`: {desc}")
+        
+        # 将该子Agent的协议说明添加到节列表
         sections.append("\n".join(lines))
-    return "\n## 子Agent委派上下文协议\n" + "\n".join(sections) if sections else ""
+    
+    # 如果有协议说明，组装成完整的提示词片段
+    if sections:
+        return "\n## 子Agent委派上下文协议\n" + "\n".join(sections)
+    else:
+        # 没有配置任何上下文协议，返回空字符串
+        return ""
 ```
 
 ---
@@ -2471,7 +3223,7 @@ MAIN_SYSTEM_PROMPT = """你是"智能采购助手"，基于 Harness Engineering 
 ### Step 1: 📝 Planning（规划）
 - 在回复开头明确输出你的任务规划
 - 格式：
-  ```
+```
   📝 任务规划：
   1. [xxx] 查询xxx数据
   2. [xxx] 分析xxx
@@ -2503,7 +3255,7 @@ MAIN_SYSTEM_PROMPT = """你是"智能采购助手"，基于 Harness Engineering 
 3. 创建/修改订单前必须获得用户确认
 4. 默认 Markdown 格式，金额保留2位小数
 """
-```
+  ```
 
 **设计要点**：
 - `{user_id}` / `{username}` / `{preferences}` 是模板变量，在 `main_agent.py` 中通过 `.format()` 填充

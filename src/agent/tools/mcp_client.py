@@ -29,7 +29,7 @@ CACHE_TTL = 300  # 5分钟缓存
 
 async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
     """
-    异步加载 MCP 工具列表（带重试和缓存）
+    异步加载 MCP 工具列表（带重试和缓存）.
 
     Args:
         force_refresh: 强制刷新缓存

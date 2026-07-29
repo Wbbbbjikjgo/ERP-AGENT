@@ -1,6 +1,6 @@
 """
 沙箱代理层（热替换，18个方法显式委托）
-SandboxBackendProxy - 稳定句柄层，支持运行时热替换底层沙箱实例
+SandboxBackendProxy - 稳定句柄层，支持运行时热替换底层沙箱实例.
 """
 from typing import Optional
 from .custom_opensandbox import CustomOpenSandbox

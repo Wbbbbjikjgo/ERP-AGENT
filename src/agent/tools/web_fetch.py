@@ -1,7 +1,7 @@
 """
 Web 抓取 & Skill 下载工具
 - web_fetch: 获取任意 URL 的文本内容（HTML→纯文本 / JSON / Markdown）
-- install_skill: 从 URL 下载 Skill 文件并安装到本地 skills 目录
+- install_skill: 从 URL 下载 Skill 文件并安装到本地 skills 目录。
 """
 import os
 import re

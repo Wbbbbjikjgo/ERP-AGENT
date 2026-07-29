@@ -249,6 +249,7 @@ def generate_chart(
 
     # 解析数据
     try:
+        #isinstance 是 Python 的内置函数，用于判断一个对象是否属于某个类型（或类型元组），返回布尔值 True 或 False。
         data_list = json.loads(data) if isinstance(data, str) else data
         if not isinstance(data_list, list) or len(data_list) == 0:
             return "错误: data 必须是非空 JSON 列表"
@@ -270,7 +271,7 @@ def generate_chart(
         "y_field": y_field,
         "series_field": series_field,
     }
-
+    #os.getpid() 是 Python 的 os 模块中的一个函数，用于获取当前进程的进程 ID（PID）。
     params_path = str(download_dir / f"_params_{os.getpid()}.json")
     script_path = str(download_dir / f"_chart_{os.getpid()}.py")
 

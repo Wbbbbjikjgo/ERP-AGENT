@@ -1,7 +1,7 @@
 """
 沙箱生命周期管理
 五态：预热池 → 认领 → MongoDB缓存 → 新建 → 销毁
-用户作用域隔离（user_id → container_id 映射）
+用户作用域隔离（user_id → container_id 映射）,
 """
 from typing import Dict, Optional
 from .custom_opensandbox import CustomOpenSandbox

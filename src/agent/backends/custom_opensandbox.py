@@ -1,7 +1,7 @@
 """
 Docker 沙箱后端
 继承 deepagents BaseSandbox，通过 Docker SDK 在隔离容器中执行命令和操作文件。
-容器名: erp-sandbox（由用户手动 docker run 启动）
+容器名: erp-sandbox（由用户手动 docker run 启动）.
 """
 import docker
 from typing import Optional
@@ -14,8 +14,8 @@ from deepagents.backends import DEFAULT_EXECUTE_TIMEOUT
 from ..log_utils import sandbox_logger
 from ..config import SANDBOX_WORK_DIR
 
-
-class DockerSandboxBackend(BaseSandbox):
+    
+class CustomOpenSandbox(BaseSandbox):
     """
     Docker 容器沙箱后端
 

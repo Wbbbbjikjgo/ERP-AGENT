@@ -1,6 +1,6 @@
 """
 中间件 6: 用户偏好自动提取 + 持久化
-对话结束后从消息中提取用户偏好 → store.aput() 更新
+对话结束后从消息中提取用户偏好 → store.aput() 更新。
 """
 import json
 from typing import Any

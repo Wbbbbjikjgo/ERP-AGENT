@@ -1,6 +1,8 @@
 """
 子Agent中间件工厂
 为 analyst / order 子Agent 提供专用中间件配置
+SummarizationMiddleware：这个是负责执行摘要的中间件。它会监控对话的 token 数量
+，当上下文窗口快满时，自动将历史对话压缩成摘要，并把完整历史存到后端存储里，防止上下文溢出
 """
 from deepagents.middleware import SummarizationToolMiddleware
 

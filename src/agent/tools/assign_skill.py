@@ -50,7 +50,7 @@ def assign_skill(skill_name: str, agent_name: str = "main") -> str:
                         available.append(item.name)
         return f"技能 '{skill_name}' 未找到。可用技能: {', '.join(available)}"
 
-    # 如果目标是子Agent，复制到对应 scope
+    # 如果目标是子Agent，复制到对应 scope。
     if agent_name != "main":
         target_dir = SKILLS_BASE_DIR / agent_name / skill_name
         if not target_dir.exists():

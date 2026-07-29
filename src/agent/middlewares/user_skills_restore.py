@@ -1,6 +1,6 @@
 """
 中间件 4: 持久化技能恢复
-从 StoreBackend 恢复用户持久化的自定义技能到沙箱
+从 StoreBackend 恢复用户持久化的自定义技能到沙箱.
 """
 from typing import Any
 

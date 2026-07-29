@@ -5,7 +5,7 @@ ERP 后端地址 + MCP 监听配置
 import os
 from dotenv import load_dotenv
 
-# 加载项目根目录 .env
+# 加载项目根目录 .env # 加载项目根目录 .env（MCP Server 独立运行，需要自己加载）
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
 # Java ERP 后端地址

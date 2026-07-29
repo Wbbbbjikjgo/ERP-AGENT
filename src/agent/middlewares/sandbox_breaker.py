@@ -1,6 +1,6 @@
 """
 中间件 7: 沙箱熔断器
-连续 N 次沙箱工具调用失败 → 短路 → 降级响应（避免无限重试拖垮系统）
+连续 N 次沙箱工具调用失败 → 短路 → 降级响应（避免无限重试拖垮系统）。
 """
 import time
 from typing import Any, Callable, Awaitable

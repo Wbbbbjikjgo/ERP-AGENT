@@ -1,6 +1,6 @@
 """
 中间件 2: 用户上下文注入
-将 ProcurementContext 注入到 agent state 的 configurable 中
+将 ProcurementContext 注入到 agent state 的 configurable 中.
 """
 from typing import Any
 

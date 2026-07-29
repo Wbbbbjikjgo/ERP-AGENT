@@ -30,3 +30,4 @@ def get_env_int(key: str, default: int = 0) -> int:
 
 # 模块加载时自动加载 .env
 load_env()
+#加载进去之后可以直接通过 os.getenv(key, default) 获取 key是键  default是默认值

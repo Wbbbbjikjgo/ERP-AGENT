@@ -66,7 +66,7 @@ def register_inventory_tools(mcp: FastMCP):
         """执行入库操作。
 
         Args:
-            part_id: 零件ID（必填）
+            part_id: 零件ID（必填）.
             quantity: 入库数量（必填，>0）
             warehouse_location: 仓库位置（可选）
 

@@ -1,6 +1,6 @@
 """
 MongoDB 连接配置
-Motor AsyncIOMotorClient 连接
+Motor AsyncIOMotorClient 连接.
 """
 import os
 from motor.motor_asyncio import AsyncIOMotorClient

@@ -10,7 +10,11 @@ from .server_config import ERP_BASE_URL, HTTP_TIMEOUT, HTTP_MAX_CONNECTIONS
 
 class ERPHttpClient:
     """ERP 后端 HTTP 客户端单例"""
-
+    """
+    HTTP 客户端采用单例模式，因为其维护昂贵的连接池资源，全局共享可复用 TCP 连接、
+    显著提升性能并统一超时/并发配置；而 LLM 实例不适合单例，因为不同任务需要独立的模型、温度、API Key 等参数配置，
+    且调用本身是无状态的，按需创建更灵活、更经济。
+    """
     _instance: Optional['ERPHttpClient'] = None
     _client: Optional[httpx.AsyncClient] = None
 

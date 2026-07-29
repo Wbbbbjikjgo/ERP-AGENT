@@ -1,6 +1,6 @@
 """
 中间件 1: 沙箱健康检查 + 自动恢复
-在每次 Agent 执行前 ping 沙箱，不可达时触发重建
+在每次 Agent 执行前 ping 沙箱，不可达时触发重建.
 """
 import asyncio
 import time

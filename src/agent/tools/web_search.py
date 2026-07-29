@@ -18,7 +18,7 @@ def web_search(query: str) -> str:
         query: 搜索查询内容，例如"摩托车火花塞市场价格趋势 2026"
 
     Returns:
-        搜索结果摘要文本
+        搜索结果摘要文本.
     """
     api_key = get_env("DASHSCOPE_API_KEY", "")
     if not api_key:

@@ -1,6 +1,6 @@
 """
 中间件 3: 本地技能同步到沙箱
-增量同步 src/skills/ → 沙箱 /skills/{scope}/（hash 比对）
+增量同步 src/skills/ → 沙箱 /skills/{scope}/（hash 比对）.
 """
 import hashlib
 import os
