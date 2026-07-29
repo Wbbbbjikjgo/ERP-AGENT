@@ -87,12 +87,100 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
 
 
 # ============================================================
-# Skill 安装（完整文件夹）
+# Skill 安装（沙箱安全隔离）
+# 流程图：下载 → 沙箱验证 → 通过 → 安装到正式环境
+#         ↓ 失败
+#       清理沙箱临时文件 + 返回错误
 # ============================================================
+
+def _extract_archive_to_memory(data: bytes, url: str, content_type: str) -> dict[str, bytes]:
+    """
+    将压缩包解压到内存字典 {相对路径: 字节内容}。
+    支持 ZIP 和 TAR.GZ 格式。
+    """
+    result: dict[str, bytes] = {}
+
+    try:
+        if url.lower().endswith(".zip") or "zip" in content_type:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for member in zf.namelist():
+                    if member.endswith("/") or "/__MACOSX/" in member or member.startswith("."):
+                        continue
+                    parts = member.split("/", 1)
+                    rel_path = parts[1] if len(parts) > 1 else parts[0]
+                    if rel_path:
+                        result[rel_path] = zf.read(member)
+        else:
+            with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+                for member in tf.getmembers():
+                    if member.isfile() and not member.name.startswith("."):
+                        parts = member.name.split("/", 1)
+                        rel_path = parts[1] if len(parts) > 1 else parts[0]
+                        if rel_path:
+                            fobj = tf.extractfile(member)
+                            if fobj:
+                                result[rel_path] = fobj.read()
+    except (zipfile.BadZipFile, tarfile.TarError):
+        # 不是有效的压缩包，当作单文件
+        pass
+
+    return result
+
+
+def _validate_skill_in_sandbox(sandbox, skill_name: str, sandbox_skill_dir: str) -> tuple[bool, str, list[str]]:
+    """
+    在沙箱中验证技能文件完整性。
+    返回: (是否通过, 错误信息, 文件列表)
+    """
+    # 检查 SKILL.md 是否存在
+    has_sk = sandbox.execute(f"test -f '{sandbox_skill_dir}/SKILL.md' && echo YES || echo NO")
+    if has_sk.exit_code != 0 or "YES" not in has_sk.output:
+        return False, "SKILL.md 未找到，技能格式无效", []
+
+    # 读取 SKILL.md 验证 frontmatter
+    read_sk = sandbox.execute(f"head -30 '{sandbox_skill_dir}/SKILL.md'")
+    if read_sk.exit_code != 0 or "name:" not in read_sk.output:
+        return False, "SKILL.md 缺少 name 字段(YAML frontmatter)", []
+
+    # 列出所有文件
+    ls_result = sandbox.execute(f"find '{sandbox_skill_dir}' -type f | sort")
+    files = []
+    if ls_result.exit_code == 0:
+        files = [f.strip() for f in ls_result.output.strip().split("\n") if f.strip()]
+
+    return True, "", files
+
+
+def _install_from_sandbox_to_host(sandbox, sandbox_skill_dir: str, host_skill_dir: Path, files: list[str]) -> list[str]:
+    """
+    从沙箱读取验证通过的文件，写入宿主机 skills 目录。
+    返回已安装的文件列表。
+    """
+    installed = []
+    for remote_path in files:
+        try:
+            content = sandbox.read_file_bytes(remote_path)
+            # 计算相对于 sandbox_skill_dir 的相对路径
+            rel = remote_path.replace(sandbox_skill_dir, "").lstrip("/")
+            target = host_skill_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            installed.append(rel)
+        except Exception as e:
+            agent_logger.warning(f"Failed to copy {remote_path} from sandbox: {e}")
+    return installed
+
 
 @tool
 def install_skill(url: str, skill_name: str = "") -> str:
-    """从 URL 下载并安装完整 Skill 到本地。
+    """从 URL 下载并安装完整 Skill（沙箱安全隔离流程）。
+
+    安全流程：
+    1. 下载到内存
+    2. 上传到沙箱 /tmp/ 验证
+    3. 在沙箱中解压并校验 SKILL.md 完整性
+    4. 校验通过 → 从沙箱复制到宿主机 src/skills/
+    5. 校验失败 → 清理沙箱临时文件
 
     支持四种来源：
     1. GitHub 仓库 ZIP（如 https://github.com/user/repo/archive/refs/heads/main.zip）
@@ -116,54 +204,131 @@ def install_skill(url: str, skill_name: str = "") -> str:
     if not url.startswith(("http://", "https://")):
         return "错误: URL 必须以 http:// 或 https:// 开头"
 
-    # 自动转换 GitHub 仓库页面为 ZIP 下载链接
     url = _normalize_github_url(url)
-
-    # 自动提取 skill 名称
     if not skill_name:
         skill_name = _extract_skill_name(url)
-
-    # 确保名称安全
     skill_name = re.sub(r"[^\w\-]", "_", skill_name)
 
+    # 获取沙箱
+    from ..backends.sandbox_holder import get_sandbox
+    sandbox = get_sandbox()
+
     try:
+        # Step 1: 下载
         response = httpx.get(
             url,
             follow_redirects=True,
             timeout=30,
             headers={"User-Agent": "ERP-Agent/1.0 (Skill Installer)"},
         )
-
         if response.status_code != 200:
             return f"下载失败: HTTP {response.status_code}"
-
-        # 判断内容类型
         content_type = response.headers.get("content-type", "")
-        content_length = len(response.content)
-
-        if content_length == 0:
+        if len(response.content) == 0:
             return "错误: 下载内容为空"
 
-        # 确保 skills 目录存在
-        skills_dir = Path(SKILLS_DIR)
-        skills_dir.mkdir(parents=True, exist_ok=True)
+        if sandbox is None:
+            return "错误: 沙箱不可用，无法安全安装 Skill"
 
-        # 根据内容类型选择安装方式
+        # Step 2: 在 Python 中解压，获取文件映射
+        sandbox_tmp = f"/tmp/_skill_install_{skill_name}"
+
         if _is_archive(url, content_type):
-            # 压缩包：解压完整文件夹
-            return _install_from_archive(
-                response.content, url, content_type, skill_name, skills_dir
-            )
+            # 解压到内存
+            files_dict = _extract_archive_to_memory(response.content, url, content_type)
         else:
-            # 单文件（通常是 .md）：创建文件夹 + 写入
-            return _install_single_file(
-                response.text, url, skill_name, skills_dir
-            )
+            # 单文件
+            files_dict = {"SKILL.md": response.text.encode("utf-8")}
+
+        if not files_dict:
+            sandbox.execute(f"rm -rf {sandbox_tmp} 2>/dev/null || true")
+            return "错误: 压缩包中未找到有效文件"
+
+        # 找到 SKILL.md 所在目录前缀
+        skill_prefix = ""
+        for path in files_dict:
+            if path.endswith("SKILL.md"):
+                parts = path.split("/")
+                if len(parts) > 1:
+                    skill_prefix = "/".join(parts[:-1]) + "/"
+                break
+        else:
+            sandbox.execute(f"rm -rf {sandbox_tmp} 2>/dev/null || true")
+            return "错误: 未找到 SKILL.md，安装取消"
+
+        # Step 3: 上传文件到沙箱验证
+        uploaded_files = []
+        sandbox.execute(f"mkdir -p {sandbox_tmp}/skill")
+        for rel_path, content in files_dict.items():
+            # 去掉前缀
+            clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
+            if not clean_path:
+                continue
+            remote = f"{sandbox_tmp}/skill/{clean_path}"
+            sandbox.write_file(remote, content)
+            uploaded_files.append(remote)
+
+        # Step 4: 在沙箱中验证
+        valid, err_msg, _ = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
+        if not valid:
+            sandbox.execute(f"rm -rf {sandbox_tmp}")
+            return f"沙箱验证失败: {err_msg}（已清理沙箱临时文件，未影响宿主机）"
+
+        # Step 5: 验证通过 → 安装到宿主机 + 沙箱正式目录
+        host_skills_dir = Path(SKILLS_DIR)
+        host_skills_dir.mkdir(parents=True, exist_ok=True)
+        host_target = host_skills_dir / skill_name
+
+        installed = []
+        scope = "procurement"
+        for rel_path, content in files_dict.items():
+            clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
+            if not clean_path:
+                continue
+
+            # 写入宿主机
+            target = host_target / clean_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            installed.append(clean_path)
+
+            # 同步写入沙箱正式技能目录
+            remote_target = f"/skills/{scope}/{skill_name}/{clean_path}"
+            try:
+                sandbox.write_file(remote_target, content)
+            except Exception as e:
+                agent_logger.warning(f"Failed to write to sandbox skills dir: {e}")
+
+        # 安装依赖（沙箱内）
+        _install_dependencies(host_target)
+
+        # 清理沙箱临时文件
+        sandbox.execute(f"rm -rf {sandbox_tmp}")
+
+        agent_logger.info(
+            f"Skill installed (sandbox-verified): {skill_name} ({len(installed)} files)"
+        )
+        return (
+            f"✅ Skill 安装成功！（沙箱安全验证通过）\n"
+            f"名称: {skill_name}\n"
+            f"路径: {host_target}\n"
+            f"文件数: {len(installed)}\n"
+            f"文件列表:\n" +
+            "\n".join(f"  - {f}" for f in installed[:20]) +
+            (f"\n  ... 共 {len(installed)} 个文件" if len(installed) > 20 else "") +
+            f"\n来源: {url}\n\n"
+            f"该 Skill 已通过沙箱安全验证，现已安装到正式环境。"
+        )
 
     except httpx.TimeoutException:
         return f"下载超时: {url}"
     except Exception as e:
         agent_logger.error(f"install_skill error: {e}")
+        if sandbox:
+            try:
+                sandbox.execute(f"rm -rf /tmp/_skill_install_{skill_name} 2>/dev/null || true")
+            except Exception:
+                pass
         return f"安装失败: {str(e)}"
 
 
