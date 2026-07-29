@@ -141,21 +141,12 @@ def create_main_agent(
         sandbox_backend = DockerSandboxBackend(container_name="erp-sandbox")
         agent_logger.info("Using Docker sandbox backend (erp-sandbox)")
 
-        # ===== 沙箱初始化：安装依赖 + 创建目录 =====
+        # ===== 沙箱初始化：创建目录 =====
+        # ⚡ 注意：依赖包（matplotlib/numpy/pandas）在 chart_generator 中按需安装
+        # 不在初始化时阻塞安装，避免 Agent 启动超时
         try:
-            # 创建沙箱内工作目录
             sandbox_backend.execute("mkdir -p /workspace/charts /workspace/output /workspace/data /skills")
             agent_logger.info("Sandbox directories created")
-
-            # 安装运行时依赖（首次安装后后续复用 Docker 缓存）
-            pip_result = sandbox_backend.execute(
-                "pip install -q matplotlib numpy pandas 2>/dev/null || true",
-                timeout=120,
-            )
-            if pip_result.exit_code == 0:
-                agent_logger.info("Sandbox dependencies installed (matplotlib, numpy, pandas)")
-            else:
-                agent_logger.warning(f"Sandbox pip install had issues: {pip_result.output[:100]}")
         except Exception as init_err:
             agent_logger.warning(f"Sandbox initialization error (non-fatal): {init_err}")
 
