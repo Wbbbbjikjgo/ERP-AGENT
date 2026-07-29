@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState } from "react";
 import { TodoItem } from "@/lib/types";
-import { CheckCircle2, Circle, Loader2, XCircle, ListTodo, ChevronDown } from "lucide-react";
+import { CheckCircle2, Circle, Loader2, XCircle, ListTodo, X } from "lucide-react";
 
 interface Props {
   items: TodoItem[];
@@ -17,20 +17,7 @@ const STATUS_CONFIG = {
 } as const;
 
 export default function TodoListPanel({ items, visible }: Props) {
-  const [open, setOpen] = useState(false);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  // 点击外部关闭
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
+  const [open, setOpen] = useState(true);
 
   if (!visible || items.length === 0) return null;
 
@@ -38,26 +25,38 @@ export default function TodoListPanel({ items, visible }: Props) {
   const progress = items.length > 0 ? (completedCount / items.length) * 100 : 0;
 
   return (
-    <div ref={panelRef} className="relative">
-      {/* 触发按钮 */}
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg hover:bg-gray-100 transition-colors text-xs text-gray-600"
-      >
-        <ListTodo size={14} className="text-blue-600" />
-        <span>{completedCount}/{items.length}</span>
-        <ChevronDown size={12} className={`transition-transform ${open ? "rotate-180" : ""}`} />
-      </button>
+    <>
+      {/* 触发按钮（面板关闭时显示） */}
+      {!open && (
+        <button
+          onClick={() => setOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg hover:bg-gray-100 transition-colors text-xs text-gray-600"
+        >
+          <ListTodo size={14} className="text-blue-600" />
+          <span>{completedCount}/{items.length}</span>
+        </button>
+      )}
 
-      {/* 下拉面板 */}
+      {/* 浮动面板（固定在右上角） */}
       {open && (
-        <div className="absolute right-0 top-full mt-1 w-72 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden z-50 animate-fade-in">
+        <div className="fixed top-16 right-4 w-72 z-50 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
           {/* 标题栏 */}
           <div className="flex items-center justify-between px-4 py-2.5 bg-gray-50/80 border-b border-gray-100">
-            <span className="text-xs font-medium text-gray-700">任务规划</span>
-            <span className="text-[11px] text-gray-400">
-              {completedCount}/{items.length} 完成
-            </span>
+            <div className="flex items-center gap-2">
+              <ListTodo size={14} className="text-blue-600" />
+              <span className="text-xs font-medium text-gray-700">任务规划</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-400">
+                {completedCount}/{items.length} 完成
+              </span>
+              <button
+                onClick={() => setOpen(false)}
+                className="p-0.5 hover:bg-gray-200 rounded transition-colors"
+              >
+                <X size={14} className="text-gray-400" />
+              </button>
+            </div>
           </div>
 
           {/* 进度条 */}
@@ -98,6 +97,6 @@ export default function TodoListPanel({ items, visible }: Props) {
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
