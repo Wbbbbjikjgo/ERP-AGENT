@@ -39,7 +39,7 @@ export default function TodoListPanel({ items, visible }: Props) {
 
       {/* 浮动面板（固定在右上角） */}
       {open && (
-        <div className="fixed top-16 right-4 w-72 z-50 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
+        <div className="fixed top-24 right-4 w-72 z-[100] rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
           {/* 标题栏 */}
           <div className="flex items-center justify-between px-4 py-2.5 bg-gray-50/80 border-b border-gray-100">
             <div className="flex items-center gap-2">
