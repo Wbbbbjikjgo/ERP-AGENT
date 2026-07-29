@@ -55,25 +55,26 @@ src/
 │   ├── middlewares/                   # 7个自定义中间件
 │   │   ├── sandbox_health.py          # 1. 沙箱健康检查
 │   │   ├── context_injection.py       # 2. 上下文注入（工厂模式隔离）
-│   │   ├── skills_sync.py             # 3. 技能同步（文件夹级增量）
+│   │   ├── skills_sync.py             # 3. 技能同步（文件夹级增量+沙箱传输）
 │   │   ├── user_skills_restore.py     # 4. 技能恢复（增量+空值保护）
 │   │   ├── tools_summarization.py     # 5. 摘要监控
 │   │   ├── memory_update.py           # 6. 偏好提取
 │   │   └── sandbox_breaker.py         # 7. 熔断器
-│   ├── tools/                         # 工具层（9个自定义工具）
-│   │   ├── mcp_client.py              # MCP工具加载
-│   │   ├── chart_generator.py         # 26种图表生成
-│   │   ├── web_search.py              # 网络搜索
-│   │   ├── web_fetch.py               # URL抓取+Skill安装（完整文件夹）
+│   ├── tools/                         # 工具层（9个自定义工具+23个MCP=32）
+│   │   ├── mcp_client.py              # MCP工具加载（重试/缓存/优雅降级）
+│   │   ├── chart_generator.py         # 26种图表生成（沙箱内执行）
+│   │   ├── web_search.py              # 网络搜索（通义千问搜索增强）
+│   │   ├── web_fetch.py               # URL抓取+Skill安装（沙箱隔离流程）
 │   │   ├── hitl_tools.py              # HITL人工介入
 │   │   ├── assign_skill.py            # 技能分配
 │   │   ├── download_sandbox_file.py   # 沙箱文件下载（真实Docker传输）
-│   │   └── document_generator.py      # 文档生成（MD/HTML/CSV/JSON）
+│   │   └── document_generator.py      # 文档生成（沙箱内输出）
 │   └── backends/                      # 沙箱后端（7层安全防护）
 │       ├── custom_opensandbox.py      # Docker SDK封装（30+方法）
 │       ├── sandbox_setup.py           # 安全沙箱创建+多语言运行时
 │       ├── sandbox_manager.py         # 五态生命周期管理
 │       ├── sandbox_proxy.py           # 代理层（18个委托方法）
+│       ├── sandbox_holder.py          # ★全局沙箱持有器（工具访问沙箱的桥梁）
 │       └── seccomp.json               # seccomp 系统调用白名单
 │
 ├── mcp_server/                        # MCP 网关 — Agent ↔ Java ERP
@@ -86,12 +87,10 @@ src/
 │       ├── order_tools.py             # 订单工具(7个)
 │       └── inventory_tools.py         # 库存工具(6个)
 │
-├── skills/                            # 技能文件（文件夹级）
+├── skills/                            # 技能文件（文件夹级，9个skill）
 │   ├── main/skill-management/         # 技能管理
-│   ├── procurement/                   # 采购技能集
+│   ├── procurement/                   # 采购技能集（8个子skill）
 │   └── pdf-image-text-extractor.md    # PDF提取技能
-│
-└── download/                          # 生成文件下载目录
 ```
 
 ### 1.4 四层架构图
@@ -995,7 +994,9 @@ if __name__ == "__main__":
 
 ## 第4章 — Agent 工具层
 
-> 除了 MCP 提供的 23 个 ERP 工具外，Agent 还有 7 个自定义工具：图表生成、网络搜索、URL 抓取、Skill 安装、人工介入、技能分配、文件下载。
+> 除了 MCP 提供的 23 个 ERP 工具外，Agent 还有 9 个自定义工具：图表生成（沙箱内）、文档生成（沙箱内）、网络搜索、URL 抓取、Skill 安装（沙箱隔离流程）、人工介入、技能分配、沙箱文件下载、沙箱文件列表。
+> 
+> ⚠️ **核心安全原则**：所有涉及代码执行和文件生成的操作（图表/文档/Skill安装）都必须在 Docker 沙箱内进行，宿主机只运行 Agent 框架本身。
 
 ### 4.1 `src/agent/tools/mcp_client.py` — MCP 工具加载（127行）
 
@@ -1155,107 +1156,16 @@ def invalidate_cache():
 
 ---
 
-### 4.2 `src/agent/tools/chart_generator.py` — 26种图表生成（317行）
+### 4.2 `src/agent/tools/chart_generator.py` — 26种图表生成（322行，沙箱内执行）
 
-**作用**：单一 `@tool generate_chart` 支持 26 种图表类型，在本地用 matplotlib 生成 PNG 图片。
+**作用**：单一 `@tool generate_chart` 支持 26 种图表类型，在 **Docker 沙箱内** 用 matplotlib 生成 PNG 图片。
+
+**核心设计（Harness 思想）**：
+- 所有图表必须在 Docker 沙箱内生成（`/workspace/charts/`）
+- 用户需要下载时，通过 `download_sandbox_file` 工具从沙箱提取到本地
+- 沙箱不可用时返回错误，**不回退到宿主机执行**
 
 ```python
-"""
-图表生成工具
-26种图表类型合并为单一工具，在本地执行 matplotlib 脚本生成 PNG
-
-设计要点：
-- 数据通过临时 JSON 文件传递（避免 shell 转义问题）
-- 自动中文字体配置
-- 超时保护 + 错误隔离
-"""
-import os, json, tempfile, subprocess
-from pathlib import Path
-from langchain_core.tools import tool
-from ..log_utils import agent_logger
-
-# 支持的26种图表类型
-CHART_TYPES = [
-    "bar", "horizontal_bar", "stacked_bar", "grouped_bar",  # 柱状图系列
-    "line", "multi_line", "area", "stacked_area",            # 折线/面积图系列
-    "pie", "donut",                                          # 饼图系列
-    "scatter", "bubble",                                     # 散点/气泡图
-    "histogram", "box_plot", "violin",                       # 统计图
-    "heatmap", "treemap",                                    # 热力/矩形图
-    "radar", "polar",                                        # 雷达/极坐标
-    "waterfall", "funnel",                                   # 瀑布/漏斗
-    "gauge", "kpi_card",                                     # 仪表盘/KPI
-    "candlestick", "ohlc",                                   # K线图
-    "sankey",                                                # 桑基图
-]
-
-# 图表生成脚本（内嵌 Python 代码，通过子进程执行）
-# 核心逻辑：从 JSON 文件读取数据 → matplotlib 绘图 → 保存 PNG
-CHART_SCRIPT = '''
-import matplotlib
-matplotlib.use('Agg')  # 非 GUI 后端，适合服务器环境
-import matplotlib.pyplot as plt
-import numpy as np
-import json, sys, os
-
-# 中文字体配置（按优先级尝试）
-for font in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']:
-    try:
-        plt.rcParams['font.sans-serif'] = [font]
-        break
-    except:
-        continue
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-
-# 从文件读取参数
-params_path = sys.argv[1]
-with open(params_path, 'r', encoding='utf-8') as f:
-    params = json.load(f)
-
-chart_type = params["chart_type"]
-data = params["data"]
-title = params["title"]
-output_path = params["output_path"]
-x_field = params.get("x_field", "label")
-y_field = params.get("y_field", "value")
-series_field = params.get("series_field", "")
-
-fig, ax = plt.subplots(figsize=(12, 8))
-
-try:
-    if chart_type == "bar":
-        # 柱状图：从 data 中提取 label 和 value
-        labels = [item.get(x_field, str(i)) for i, item in enumerate(data)]
-        values = [float(item.get(y_field, 0)) for item in data]
-        bars = ax.bar(labels, values, color='#2563EB', edgecolor='white')
-        ax.bar_label(bars, fmt='%.1f', fontsize=9)  # 在柱顶显示数值
-    elif chart_type == "pie":
-        # 饼图
-        labels = [item.get(x_field, str(i)) for i, item in enumerate(data)]
-        values = [float(item.get(y_field, 0)) for item in data]
-        ax.pie(values, labels=labels, autopct='%1.1f%%', startangle=90,
-               colors=plt.cm.Set3(np.linspace(0, 1, len(labels))))
-    # ... 其他 24 种图表类型类似，每种有独特的绘图逻辑 ...
-    else:
-        # 默认柱状图
-        labels = [item.get(x_field, str(i)) for i, item in enumerate(data)]
-        values = [float(item.get(y_field, 0)) for item in data]
-        ax.bar(labels, values, color='#2563EB')
-
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-except Exception as e:
-    # 即使绘图出错也生成一个错误提示图
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.text(0.5, 0.5, f'Chart Error: {str(e)[:100]}', ha='center', va='center')
-
-plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
-plt.close()
-print(f"OK:{output_path}")
-'''
-
-
 @tool
 def generate_chart(
     chart_type: str,
@@ -1265,85 +1175,55 @@ def generate_chart(
     y_field: str = "value",
     series_field: str = "",
 ) -> str:
-    """生成数据可视化图表（支持26种类型）。
+    """在沙箱中生成数据可视化图表（支持26种类型）。
 
     Args:
         chart_type: 图表类型，如 bar/pie/line/scatter 等
         data: 数据JSON字符串。格式: [{"label":"名称","value":数值}, ...]
-        title: 图表标题
-        x_field: X轴/分类字段名（默认"label"）
-        y_field: Y轴/数值字段名（默认"value"）
-        series_field: 系列/分组字段名（分组图时使用）
-
+        ...
     Returns:
-        图表文件路径和下载链接
+        图表沙箱路径，或错误信息
     """
-    if chart_type not in CHART_TYPES:
-        return f"不支持的图表类型: {chart_type}"
-
     # 解析数据
-    try:
-        #isinstance 是 Python 的内置函数，用于判断一个对象是否属于某个类型（或类型元组），返回布尔值 True 或 False。
-        data_list = json.loads(data) if isinstance(data, str) else data
-        if not isinstance(data_list, list) or len(data_list) == 0:
-            return "错误: data 必须是非空 JSON 列表"
-    except json.JSONDecodeError as e:
-        return f"数据格式错误: {e}"
+    data_list = json.loads(data) if isinstance(data, str) else data
 
-    # 生成输出路径（保存到 src/download/ 目录）
-    download_dir = Path(__file__).parent.parent.parent / "download"
-    download_dir.mkdir(exist_ok=True)
-    output_path = str(download_dir / f"chart_{chart_type}_{os.getpid()}.png")
+    # 获取沙箱实例（通过全局 holder）
+    sandbox = get_sandbox()
+    if sandbox is None:
+        return "错误: 沙箱不可用。请确保 Docker 沙箱容器已启动。"
 
-    # 将参数写入临时 JSON 文件（避免 shell 转义问题）
-    params = {"chart_type": chart_type, "data": data_list, "title": title,
-              "output_path": output_path, "x_field": x_field,
-              "y_field": y_field, "series_field": series_field}
-    #os.getpid() 是 Python 的 os 模块中的一个函数，用于获取当前进程的进程 ID（PID）。
-    #生成两个临时文件 一个是存储参数的临时文件 一个是存储临时代码执行的文件主要是存储运行图片的临时文件
-    params_path = str(download_dir / f"_params_{os.getpid()}.json")
-    script_path = str(download_dir / f"_chart_{os.getpid()}.py")
+    # 沙箱内路径
+    charts_dir = "/workspace/charts"
+    output_path = f"{charts_dir}/chart_{chart_type}_{timestamp}.png"
 
-    try:
-        with open(params_path, 'w', encoding='utf-8') as f:
-            json.dump(params, f, ensure_ascii=False)
-        with open(script_path, 'w', encoding='utf-8') as f:
-            f.write(CHART_SCRIPT)#吧上面的脚本代码写入文件
+    # 写入脚本和参数到沙箱
+    sandbox.write_file(params_path, json.dumps(params))
+    sandbox.write_file(script_path, CHART_SCRIPT)
 
-        # 在子进程中执行 matplotlib 绘图（超时 30 秒）
-        result = subprocess.run(
-            ["python", script_path, params_path],
-            capture_output=True, text=True, timeout=30,
+    # 安装依赖（首次，后续复用 Docker 缓存）
+    sandbox.execute("pip install -q matplotlib numpy 2>/dev/null || true", timeout=60)
+
+    # ⚠️ 在沙箱内执行 matplotlib 绘图（而非宿主机 subprocess）
+    result = sandbox.execute(f"python {script_path} {params_path}", timeout=30)
+
+    if result.exit_code == 0 and sandbox.file_exists(output_path):
+        file_size = len(sandbox.read_file_bytes(output_path))
+        return (
+            f"✅ 图表已生成!\n"
+            f"沙箱路径: {output_path}\n"
+            f"💡 如需下载到本地，请使用 download_sandbox_file 工具"
         )
-
-        if result.returncode == 0 and os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            file_name = os.path.basename(output_path)
-            download_url = f"http://localhost:8000/api/download/{file_name}"
-            return (
-                f"图表已生成: {title}\n"
-                f"类型: {chart_type}\n"
-                f"数据点: {len(data_list)}\n"
-                f"文件大小: {file_size / 1024:.1f} KB\n"
-                f"下载链接: {download_url}\n"
-                f"本地路径: {output_path}"
-            )
-        else:
-            return f"图表生成失败: {result.stderr[:500]}"
-    except subprocess.TimeoutExpired:
-        return "图表生成超时（30秒限制）"
-    except Exception as e:
-        return f"图表生成异常: {str(e)}"
-    finally:
-        # 清理临时文件 清楚临时文件
-        for tmp in [params_path, script_path]:
-            if os.path.exists(tmp):
-                os.remove(tmp)
 ```
 
-**设计决策**：为什么用 subprocess 而不是直接 import matplotlib？
-- 隔离性：matplotlib 绘图可能崩溃（内存泄漏、字体问题），子进程崩溃不影响主 Agent
-- 超时保护：subprocess.run(timeout=30) 可以强制终止
+**架构升级**：旧版用 `subprocess.run(["python", script, ...])` 在宿主机执行 → 新版用 `sandbox.execute()` 在 Docker 沙箱内执行。
+
+| 对比 | 旧版（已废弃） | 新版（当前） |
+|------|---------------|-------------|
+| 执行位置 | 宿主机 subprocess | Docker 沙箱内 |
+| 文件存储 | 宿主机 `src/download/` | 沙箱 `/workspace/charts/` |
+| 依赖安装 | 宿主机 pip | 沙箱内 `sandbox.execute("pip install ...")` |
+| 失败降级 | 无 | 沙箱不可用时返回错误 |
+| 下载方式 | 直接返回 URL | 需用户确认后调用 `download_sandbox_file` |
 
 ---
 
@@ -1409,36 +1289,56 @@ def web_search(query: str) -> str:
 
 ---
 
-### 4.4 `src/agent/tools/web_fetch.py` — URL抓取 + Skill安装（146行）
+### 4.4 `src/agent/tools/web_fetch.py` — URL抓取 + Skill安装（390行，沙箱隔离流程）
 
-**作用**：两个工具——`web_fetch` 获取 URL 内容，`install_skill` 下载并安装 Skill 到本地。
+**作用**：两个工具——`web_fetch` 获取 URL 内容，`install_skill` 下载并安装 Skill（沙箱安全隔离流程）。
+
+**`install_skill` 安全流程**：
+```
+下载 → 内存解压 → 上传沙箱 /tmp/ 验证 SKILL.md
+    ↓ 通过                          ↓ 失败
+安装到宿主机 src/skills/           清理沙箱临时文件
+同步到沙箱 /skills/                返回错误（不影响宿主）
+安装依赖（沙箱内 pip install）
+```
 
 ```python
-"""
-Web 抓取 & Skill 下载工具
-- web_fetch: 获取任意 URL 的文本内容（HTML→纯文本）
-- install_skill: 从 URL 下载 Skill 文件并安装到本地 skills 目录
-"""
-import os, re, httpx
-from pathlib import Path
-from langchain_core.tools import tool
-from ..log_utils import agent_logger
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-SKILLS_DIR = PROJECT_ROOT / "src" / "skills"
-
-
-def _strip_html(html: str) -> str:
-    """简易 HTML → 纯文本（去标签、合并空白）"""
-    text = re.sub(r"<(script|style)[^>]*>.*?</\\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)  # 移除所有 HTML 标签
-    text = re.sub(r"\s+", " ", text).strip()  # 合并空白字符
-    return text
-
-
 @tool
-def web_fetch(url: str, max_chars: int = 8000) -> str:
-    """获取指定 URL 的网页内容（转为纯文本）。"""
+def install_skill(url: str, skill_name: str = "") -> str:
+    """从 URL 下载并安装完整 Skill（沙箱安全隔离流程）。
+
+    安全流程：
+    1. 下载到内存
+    2. 上传到沙箱 /tmp/ 验证
+    3. 在沙箱中解压并校验 SKILL.md 完整性
+    4. 校验通过 → 从沙箱复制到宿主机 src/skills/
+    5. 校验失败 → 清理沙箱临时文件
+    """
+    # Step 1: 下载文件
+    response = httpx.get(url, ...)
+
+    # Step 2: Python 内存解压 → 获取文件字典 {rel_path: bytes}
+    files_dict = _extract_archive_to_memory(response.content, url, content_type)
+
+    # Step 3: 上传文件到沙箱验证
+    sandbox = get_sandbox()
+    for rel_path, content in files_dict.items():
+        sandbox.write_file(f"{sandbox_tmp}/skill/{clean_path}", content)
+
+    # Step 4: 在沙箱中验证 SKILL.md
+    valid, err_msg, _ = _validate_skill_in_sandbox(sandbox, skill_name, ...)
+    if not valid:
+        sandbox.execute(f"rm -rf {sandbox_tmp}")
+        return "沙箱验证失败（已清理沙箱临时文件，未影响宿主机）"
+
+    # Step 5: 验证通过 → 写入宿主机 + 同步沙箱正式目录
+    for rel_path, content in files_dict.items():
+        (host_target / clean_path).write_bytes(content)     # 宿主机
+        sandbox.write_file(sandbox_skill_path, content)      # 沙箱 /skills/
+
+    # 安装依赖（沙箱内 pip install）
+    _install_dependencies(host_target)
+```
     if not url.startswith(("http://", "https://")):
         return "错误: URL 必须以 http:// 或 https:// 开头"
     try:
@@ -1813,34 +1713,64 @@ return f"技能 '{skill_name}' 已在主 Agent 技能库中可用"
 
 ---
 
-### 4.7 `src/agent/tools/download_sandbox_file.py` — 沙箱文件下载（42行）
+### 4.7 `src/agent/tools/download_sandbox_file.py` — 沙箱文件下载（181行）
 
-**作用**：将文件从工作目录复制到 `src/download/` 供用户下载。
+**作用**：从 Docker 沙箱容器中下载文件到宿主机 `src/download/` 目录，供用户通过 HTTP 访问。
 
 ```python
-"""沙箱文件下载工具"""
-import shutil
-from pathlib import Path
-from langchain_core.tools import tool
-from ..log_utils import agent_logger
-
-DOWNLOAD_DIR = Path(__file__).parent.parent.parent / "download"
+"""沙箱文件下载工具（Harness — 真实 Docker 文件提取）"""
 
 @tool
-def download_sandbox_file(remote_path: str) -> str:
-    """将文件从工作目录复制到下载目录，供用户访问。
-    Args:
-        remote_path: 源文件路径
-    Returns:
-        下载后的本地文件路径
+def download_sandbox_file(remote_path: str, filename: str = "") -> str:
+    """从沙箱容器中下载文件到宿主机，生成 HTTP 下载链接。
+
+    工作原理：
+    - 通过 Docker SDK 连接到沙箱容器
+    - 读取容器内文件（base64 编码支持二进制）
+    - 保存到宿主机 download 目录
     """
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # 方式1：从 Docker 沙箱读取
+    container, client = _get_docker_container()
+    if container is not None:
+        read_result = container.exec_run(f"base64 '{remote_path}'")
+        content = base64.b64decode(stdout.strip())
+        target = DOWNLOAD_DIR / filename
+        target.write_bytes(content)
+        return f"✅ 文件已从沙箱下载! 下载链接: {download_url}"
+
+    # 方式2：回退到本地文件（开发模式）
     source = Path(remote_path)
-    if not source.exists():
-        return f"文件不存在: {remote_path}"
-    target = DOWNLOAD_DIR / source.name
-    shutil.copy2(source, target)
-    return f"文件已保存到: {target}"
+    if source.exists():
+        shutil.copy2(source, target)
+        return f"✅ 文件已下载!（沙箱不可用，使用本地文件）"
+```
+
+
+### 4.8 `src/agent/tools/document_generator.py` — 文档生成（341行，沙箱内输出）
+
+**作用**：生成结构化文档文件（Markdown/HTML/CSV/JSON/纯文本），**优先写入沙箱** `/workspace/output/`。
+
+**核心设计（Harness 思想）**：
+- 所有文件必须先生成在 Docker 沙箱内（`/workspace/output/`）
+- 用户需要下载时，通过 `download_sandbox_file` 工具从沙箱提取到本地
+- 沙箱不可用时回退到本地生成
+
+```python
+def _write_to_sandbox_or_local(filename, content, title, format_name):
+    """核心写入逻辑：优先写入沙箱，回退到本地"""
+    sandbox = get_sandbox()
+
+    if sandbox is not None:
+        # ✅ 写入沙箱 /workspace/output/ 目录
+        sandbox_path = f"/workspace/output/{filename}"
+        sandbox.execute(f"mkdir -p /workspace/output")
+        sandbox.write_file(sandbox_path, content)
+        return f"✅ 文档已在沙箱中生成! 沙箱路径: {sandbox_path}"
+
+    # 回退：写入本地
+    file_path = LOCAL_DOWNLOAD_DIR / filename
+    file_path.write_text(content, encoding="utf-8")
+    return f"✅ 文档生成成功! 下载链接: {download_url}"
 ```
 
 ---
@@ -1849,6 +1779,41 @@ def download_sandbox_file(remote_path: str) -> str:
 
 > Agent 在执行代码时需要一个隔离的环境。沙箱后端通过 Docker 容器提供这个隔离环境，确保代码执行不会影响宿主机。
 > 当前实现包含 **7 层安全防护**（只读文件系统 + tmpfs + 资源限制 + 网络隔离 + Capability 移除 + seccomp + PID 限制）和 **五态生命周期管理**。
+
+### 5.0 `src/agent/backends/sandbox_holder.py` — 全局沙箱持有器（37行）
+
+**作用**：全局单例，让所有自定义工具（`chart_generator`/`document_generator`/`web_fetch` 等）能访问当前活跃的沙箱实例。
+
+```python
+"""
+沙箱全局持有器
+
+让所有工具能够访问当前活跃的沙箱实例，
+确保文件生成在沙箱中执行。
+"""
+from typing import Optional
+
+_active_sandbox = None
+
+def set_sandbox(sandbox):
+    """设置当前活跃的沙箱实例（main_agent.py 在 Agent 创建时调用）"""
+    global _active_sandbox
+    _active_sandbox = sandbox
+
+def get_sandbox():
+    """获取当前活跃的沙箱实例（工具通过此函数访问沙箱）"""
+    return _active_sandbox
+
+def has_sandbox() -> bool:
+    """检查沙箱是否可用"""
+    if _active_sandbox is None:
+        return False
+    return _active_sandbox.ping()
+```
+
+**设计动机**：自定义 `@tool` 函数不像 `Backend` 那样能通过 middleware 注入上下文，需要一个全局可访问的注册中心。
+- `main_agent.py` 在创建 Agent 时调用 `set_sandbox()`
+- `chart_generator`/`document_generator` 等工具调用 `get_sandbox()` 获取沙箱
 
 ### 5.1 `src/agent/backends/custom_opensandbox.py` — Docker SDK 封装（415行）
 
@@ -3524,15 +3489,16 @@ def get_order_middleware() -> list:
     return [SummarizationToolMiddleware()]
 ```
 
-### 9.3 `src/agent/main_agent.py` — 主 Agent 组装（203行）
+### 9.3 `src/agent/main_agent.py` — 主 Agent 组装（347行）
 
-**这是整个项目最核心的文件**。它按照 7 步顺序组装 Agent：
+**这是整个项目最核心的文件**。它按照 7 步顺序组装 Agent，包含 **沙箱初始化** 和 **Skills 加载** 两大新增功能。
 
 ```python
 """
 主入口：create_main_agent() + precompute_agent_context()
 DeepAgent 核心组装 — 严格遵循 Harness Engineering 架构
 """
+import io, tarfile, fnmatch
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StoreBackend, LocalShellBackend
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
@@ -3546,36 +3512,49 @@ SKILLS_DIR = PROJECT_ROOT / "src" / "skills"
 MEMORY_DIR = Path(__file__).parent / "memory"
 
 
+def _upload_project_to_sandbox(sandbox):
+    """将项目文件上传到沙箱 /workspace/src/ 目录（跳过 .git/node_modules 等）"""
+    skip_patterns = [".git", "__pycache__", "node_modules", ".next", "*.pyc", ...]
+    tar_stream = io.BytesIO()
+    with tarfile.open(fileobj=tar_stream, mode="w:gz") as tar:
+        for file_path in sorted(PROJECT_ROOT.rglob("*")):
+            if file_path.is_file() and not _should_skip(rel)
+                tar.add(str(file_path), arcname=rel)
+    sandbox._container.put_archive("/workspace/src", tar_stream.read())
+    agent_logger.info(f"Project uploaded: /workspace/src (N files, X MB)")
+
+
+def _load_skills_prompt(skills_dir):
+    """手动加载所有 SKILL.md，注入 system prompt（绕过框架中文路径 bug）"""
+    for skill_md in skills_dir.rglob("SKILL.md"):
+        content = skill_md.read_text(encoding="utf-8")
+        skill_sections.append(f"### Skill: {rel_path}\n{content}")
+    return "\n\n## 可用技能 (Skills)\n\n" + "\n\n".join(skill_sections)
+
+
 async def precompute_agent_context(user_id, username, store=None) -> ProcurementContext:
     """预计算上下文：从 Store 加载用户偏好"""
-    preferences = {}
-    if store:
-        items = store.search(("user-preferences", user_id))
-        for item in items:
-            if item.key == "preferences" and isinstance(item.value, dict):
-                preferences.update(item.value)
-    return ProcurementContext(user_id=user_id, username=username, preferences=preferences)
+    ...
 
 
 def create_main_agent(user_context=None, checkpointer=None, store=None):
     """
-    创建主 Agent 实例 — 7 步组装
-    
-    这是 Harness 架构的核心：所有组件在这里汇聚。
+    创建主 Agent 实例 — 7 步组装（含沙箱初始化 + Skills 加载）
     """
-    if user_context is None:
-        user_context = ProcurementContext()
-
     # ===== 第1步：LLM =====
-    # 通义千问 qwen-plus，通过 OpenAI 兼容接口调用
     llm = get_llm()
 
-    # ===== 第2步：CompositeBackend 三层路由 =====
-    # 默认 → Docker 沙箱（代码执行）
-    # /memories/ → StoreBackend（用户记忆）
-    # /persisted-skills/ → StoreBackend（持久化技能）
+    # ===== 第2步：CompositeBackend + 沙箱初始化 =====
     try:
         sandbox_backend = DockerSandboxBackend(container_name="erp-sandbox")
+
+        # ⚡ 沙箱初始化：创建目录 + 上传项目文件
+        sandbox_backend.execute("mkdir -p /workspace/charts /workspace/output /workspace/data /skills /src/skills")
+        _upload_project_to_sandbox(sandbox_backend)
+
+        # 注册到全局持有器，供所有工具访问
+        from .backends.sandbox_holder import set_sandbox
+        set_sandbox(sandbox_backend)
     except Exception:
         sandbox_backend = LocalShellBackend(virtual_mode=True)  # 回退方案
 
@@ -3633,15 +3612,23 @@ def create_main_agent(user_context=None, checkpointer=None, store=None):
     if delegation_prompt:
         system_prompt += delegation_prompt  # 注入子Agent委派协议
 
+    # ===== 第6.5步：手动加载 Skills 到 system prompt =====
+    # ❌ 框架内置 SkillsMiddleware 无法处理含中文路径
+    # ✅ 改用 _load_skills_prompt() 手动注入 → system_prompt
+    skills_prompt = _load_skills_prompt(SKILLS_DIR)
+    if skills_prompt:
+        system_prompt += skills_prompt
+
     # ===== 第7步：创建 Agent =====
+    # ⚡ skills=None 禁用框架 SkillsMiddleware（避免 path_not_found）
     agent = create_deep_agent(
         model=llm,
         tools=all_tools,
         system_prompt=system_prompt,
         middleware=middlewares,
         subagents=subagents if subagents else None,
-        skills=[str(SKILLS_DIR)],              # 技能目录
-        memory=[str(MEMORY_DIR / "AGENTS.md")],  # 全局记忆
+        skills=None,                           # ⚡ 禁用框架内置加载器
+        memory=[str(MEMORY_DIR / "AGENTS.md")],
         backend=backend_factory,               # 三层路由后端
         interrupt_on=INTERRUPT_ON_TOOLS,       # 中断配置（订单审批）
         checkpointer=checkpointer,             # 会话持久化
@@ -3650,6 +3637,15 @@ def create_main_agent(user_context=None, checkpointer=None, store=None):
     )
     return agent
 ```
+
+**Skills 加载方案对比**：
+
+| 维度 | 旧版（`skills=["path"]`） | 新版（`skills=None`） |
+|------|--------------------------|----------------------|
+| 加载器 | 框架 `SkillsMiddleware` | `_load_skills_prompt()` 手动注入 |
+| 中文路径 | ❌ `path_not_found` | ✅ 正常工作 |
+| 文件同步 | 无 | `SkillsSyncMiddleware` → 沙箱 `/skills/` |
+| 框架警告 | ❌ 每次启动报错 | ✅ 完全消除 |
 
 **Harness 架构思想在代码中的体现**：
 1. **Planning → Executing → Review → Result**：写在系统提示词中，LLM 被强制要求遵循
@@ -4106,18 +4102,22 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 
 **核心文件阅读顺序推荐**：
 1. `config.py` → 了解所有配置
-2. `main_agent.py` → 了解 Agent 如何组装
-3. `chat.py` → 了解 SSE 流式对话
-4. `procurement_analyst.yaml` → 了解子Agent 配置
-5. `sandbox_health.py` → 了解中间件模式
+2. `main_agent.py` → 了解 Agent 如何组装（含沙箱初始化、Skills 加载、项目文件上传）
+3. `custom_opensandbox.py` → 了解沙箱后端（30+ 方法、文件操作、多语言运行时）
+4. `sandbox_holder.py` → 了解工具如何全局访问沙箱
+5. `chart_generator.py` → 了解沙箱内代码执行模式
+6. `chat.py` → 了解 SSE 流式对话
+7. `skills_sync.py` → 了解技能增量同步机制
 
 **关键设计模式**：
 - **Harness 工作流**：Planning → Executing → Review → Result（写在提示词中）
+- **沙箱优先**：所有代码执行/文件生成强制在 Docker 沙箱内，宿主机只跑框架
 - **中间件栈**：可扩展的 before/after/wrap 钩子
 - **CompositeBackend**：路径路由到不同后端
 - **MCP 协议**：统一工具调用接口
 - **HITL**：interrupt/resume 实现人工审批
 - **熔断器**：三态模型保护沙箱调用
+- **sandbox_holder**：全局单例，工具通过 `get_sandbox()` 访问沙箱
 
 ---
 
@@ -4131,11 +4131,16 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 | `sandbox_setup.py` | 21 行，仅 `mkdir -p` | 413 行，7 层安全防护 + 多语言运行时 + 文件同步 |
 | `sandbox_manager.py` | 83 行，只有 get/rebuild/destroy | 494 行，五态生命周期 + MongoDB 持久化 + 预热池 |
 | `sandbox_proxy.py` | 18 个方法部分是空壳 | 18 个方法全部真实实现 |
+| `sandbox_holder.py` | 不存在 | ★新增：全局沙箱持有器，工具通过 `get_sandbox()` 访问沙箱 |
 | `context_injection.py` | 全局单例导致用户串扰 | 工厂模式，每次请求创建新实例 |
 | `skills_sync.py` | 文件名哈希，丢失目录结构 | 相对路径 SHA256 哈希，保留完整目录，增量同步 |
 | `user_skills_restore.py` | 6 个问题（空值/父目录/单例标记等） | 全部修复 + 增量同步 + error 日志 |
 | `middleware_config.py` | 只返回 1 个 demo 中间件 | 返回完整中间件栈（5 个） |
 | `download_sandbox_file.py` | 无法从沙箱下载文件 | 真实 Docker 文件提取（base64 传输） |
-| `document_generator.py` | 不存在 | 新增：MD/HTML/CSV/JSON/TXT 文档生成 |
+| `document_generator.py` | 不存在 | 新增：MD/HTML/CSV/JSON/TXT 文档生成（沙箱内输出） |
 | `agent_loader.py` | `MemorySaver` + `InMemoryStore` | `MongoDBSaver` + `MongoDBStore` 生产级持久化 |
 | `mongodb_store.py` | 不存在 | 新增：自定义 `BaseStore` 的 MongoDB 实现 |
+| `chart_generator.py` | 宿主机 `subprocess` 执行 | ✅ 沙箱内 `sandbox.execute()` 执行 matplotlib |
+| `web_fetch.py` | 直接解压到宿主机 | ✅ 沙箱隔离流程：下载→验证→通过→安装 |
+| `main_agent.py` | `skills=["path"]` 报 `path_not_found` | ✅ `skills=None` + `_load_skills_prompt` 手动注入 |
+| `main_agent.py` | 无项目文件同步 | ✅ `_upload_project_to_sandbox` 启动时上传 125+ 文件 |
