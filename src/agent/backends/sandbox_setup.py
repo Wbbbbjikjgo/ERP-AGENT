@@ -21,6 +21,9 @@ from .custom_opensandbox import CustomOpenSandbox
 from ..log_utils import sandbox_logger
 from ..config import SANDBOX_WORK_DIR, SANDBOX_IMAGE
 
+# 项目根目录（用于定位本地文件同步到沙箱）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
 
 # ============================================================
 # 沙箱配置数据类
@@ -349,5 +352,61 @@ def create_and_setup_sandbox(
     # 初始化标准目录结构
     sandbox.execute("mkdir -p /workspace /skills /data /analysis /output")
 
+    # === 关键：将项目文件同步到沙箱（实现真正的隔离测试）===
+    _sync_project_files(sandbox)
+
     sandbox_logger.info(f"Sandbox created and initialized for user: {user_id}")
     return sandbox
+
+
+# ============================================================
+# 项目文件同步到沙箱（Harness 隔离性核心）
+# ============================================================
+
+def _sync_project_files(sandbox: CustomOpenSandbox):
+    """
+    将项目关键文件同步到沙箱内，确保沙箱内可以独立测试和运行代码。
+
+    同步内容：
+    1. src/skills/       → /skills/       （技能文件）
+    2. .env              → /workspace/.env （环境变量）
+    3. requirements.txt  → /workspace/requirements.txt （依赖）
+    4. src/mcp_server/   → /workspace/mcp_server/ （MCP 工具，可测试调用）
+    5. src/agent/tools/  → /workspace/agent_tools/ （Agent 工具脚本）
+
+    这样沙箱内不仅有工作空间，还有完整的测试环境。
+    """
+    sync_map = [
+        # (本地路径, 沙箱目标路径, 描述)
+        (PROJECT_ROOT / "src" / "skills", "/skills", "Skills"),
+        (PROJECT_ROOT / ".env", "/workspace/.env", ".env"),
+        (PROJECT_ROOT / "requirements.txt", "/workspace/requirements.txt", "requirements.txt"),
+        (PROJECT_ROOT / "src" / "mcp_server", "/workspace/mcp_server", "MCP Server"),
+        (PROJECT_ROOT / "src" / "agent" / "tools", "/workspace/agent_tools", "Agent Tools"),
+        (PROJECT_ROOT / "src" / "agent" / "schema.py", "/workspace/schema.py", "Schema"),
+        (PROJECT_ROOT / "src" / "agent" / "config.py", "/workspace/config.py", "Config"),
+    ]
+
+    synced = 0
+    for local_path, remote_path, desc in sync_map:
+        try:
+            if local_path.is_dir():
+                # 目录：tar 打包上传
+                result = sandbox.upload_directory(str(local_path), remote_path)
+                if result.startswith("OK"):
+                    sandbox_logger.info(f"Synced {desc}: {local_path} -> {remote_path}")
+                    synced += 1
+                else:
+                    sandbox_logger.warning(f"Sync {desc} failed: {result}")
+            elif local_path.is_file():
+                # 单文件：直接写入
+                content = local_path.read_bytes()
+                sandbox.upload_files([(remote_path, content)])
+                sandbox_logger.info(f"Synced {desc}: {local_path} -> {remote_path}")
+                synced += 1
+            else:
+                sandbox_logger.debug(f"Skip sync {desc}: {local_path} not found")
+        except Exception as e:
+            sandbox_logger.warning(f"Sync {desc} error: {e}")
+
+    sandbox_logger.info(f"Project files synced: {synced}/{len(sync_map)} items")
