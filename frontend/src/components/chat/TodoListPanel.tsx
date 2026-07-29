@@ -26,7 +26,7 @@ export default function TodoListPanel({ items, visible }: Props) {
   const progress = items.length > 0 ? (completedCount / items.length) * 100 : 0;
 
   return (
-    <div className="fixed top-20 right-4 w-72 z-[9999] rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
+    <div className="fixed top-2 right-4 w-72 z-[9999] rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
       <div className="flex items-center justify-between px-4 py-2.5 bg-gray-50/80 border-b border-gray-100">
         <div className="flex items-center gap-2">
           <ListTodo size={14} className="text-blue-600" />
