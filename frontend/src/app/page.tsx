@@ -89,6 +89,7 @@ export default function Home() {
         interruptData={chat.interruptData}
         todoItems={chat.todoItems}
         todoVisible={chat.todoVisible}
+        pendingQueue={chat.pendingQueue}
         phase={chat.phase}
         phaseLabel={chat.phaseLabel}
         onSend={chat.sendMessage}

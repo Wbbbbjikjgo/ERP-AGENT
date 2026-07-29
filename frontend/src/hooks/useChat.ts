@@ -23,10 +23,12 @@ export function useChat() {
   const [todoVisible, setTodoVisible] = useState(false);
   const [phase, setPhase] = useState<HarnessPhase>("idle");
   const [phaseLabel, setPhaseLabel] = useState("");
+  const [pendingQueue, setPendingQueue] = useState<string[]>([]);
 
   const assistantMsgRef = useRef<string>("");
   const toolCallsRef = useRef<ToolCallInfo[]>([]);
   const currentToolIdRef = useRef<string>("");
+  const pendingQueueRef = useRef<string[]>([]);
 
   const resetAssistantState = useCallback(() => {
     assistantMsgRef.current = "";
@@ -162,7 +164,6 @@ export function useChat() {
           setStreaming(false);
           setPhase("done");
           setPhaseLabel("✅ 完成");
-          // 将所有 todo 标记为完成
           setTodoItems((prev) =>
             prev.map((item) =>
               item.status !== "cancelled" ? { ...item, status: "complete" as const } : item
@@ -170,6 +171,14 @@ export function useChat() {
           );
           if (event.interrupted) {
             setInterrupted(true);
+          }
+          // 检查排队队列，有消息自动发出
+          const q = pendingQueueRef.current;
+          if (q.length > 0) {
+            const next = q.shift()!;
+            setPendingQueue([...q]);
+            // 延迟一帧发送，确保 streaming 状态已更新
+            setTimeout(() => doSend(next), 50);
           }
           break;
       }
@@ -188,10 +197,9 @@ export function useChat() {
     },
   });
 
-  const sendMessage = useCallback(
+  // 实际的发送逻辑（非排队）
+  const doSend = useCallback(
     (content: string) => {
-      if (!content.trim() || streaming) return;
-
       setError(null);
       setInterrupted(false);
       setInterruptData(null);
@@ -202,7 +210,6 @@ export function useChat() {
       setPhaseLabel("");
       resetAssistantState();
 
-      // 添加用户消息
       const userMsg: ChatMessage = {
         id: uuidv4(),
         role: "user",
@@ -225,7 +232,24 @@ export function useChat() {
         )
       );
     },
-    [streaming, threadId, start, resetAssistantState]
+    [threadId, start, resetAssistantState]
+  );
+
+  const sendMessage = useCallback(
+    (content: string) => {
+      if (!content.trim()) return;
+
+      if (streaming) {
+        // 正在回答：加入排队队列，回答完后自动发送
+        const q = [...pendingQueueRef.current, content.trim()];
+        pendingQueueRef.current = q;
+        setPendingQueue(q);
+        return;
+      }
+
+      doSend(content.trim());
+    },
+    [streaming, doSend]
   );
 
   const resumeWith = useCallback(
@@ -254,6 +278,8 @@ export function useChat() {
     setInterruptData(null);
     setError(null);
     setThreadId(uuidv4());
+    setPendingQueue([]);
+    pendingQueueRef.current = [];
     resetAssistantState();
   }, [abort, resetAssistantState]);
 
@@ -281,6 +307,7 @@ export function useChat() {
     error,
     todoItems,
     todoVisible,
+    pendingQueue,
     phase,
     phaseLabel,
     sendMessage,
