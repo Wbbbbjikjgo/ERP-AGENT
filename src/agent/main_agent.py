@@ -128,9 +128,24 @@ def _load_skills_prompt(skills_dir: Path) -> str:
     if not skill_sections:
         return ""
 
+    # 构建技能摘要列表（name + description）
+    import re as _re
+    skill_summary = []
+    for section in skill_sections:
+        name_match = _re.search(r"name: (\S+)", section)
+        desc_match = _re.search(r"description: (.+)", section)
+        name = name_match.group(1) if name_match else "?"
+        desc = desc_match.group(1) if desc_match else ""
+        if name not in ("skill-name", "str", "?"):
+            skill_summary.append(f"- **{name}**: {desc}")
+
+    summary_block = "\n".join(skill_summary) if skill_summary else ""
+
     return (
-        "\n\n---\n\n## 可用技能 (Skills)\n\n"
-        "以下技能已加载到沙箱 /skills/ 目录，可通过沙箱执行：\n\n"
+        "\n\n---\n\n"
+        "## 可用技能 (Skills)\n\n"
+        "以下技能已加载到沙箱 **/skills/** 目录和 **/src/skills/** 目录，可通过沙箱执行：\n\n"
+        + (summary_block + "\n\n---\n\n" if summary_block else "")
         + "\n\n".join(skill_sections)
     )
 
@@ -209,11 +224,22 @@ def create_main_agent(
         # ⚡ 注意：依赖包（matplotlib/numpy/pandas）在 chart_generator 中按需安装
         # 不在初始化时阻塞安装，避免 Agent 启动超时
         try:
-            sandbox_backend.execute("mkdir -p /workspace/charts /workspace/output /workspace/data /skills")
+            sandbox_backend.execute(
+                "mkdir -p /workspace/charts /workspace/output /workspace/data /skills /src/skills"
+            )
             agent_logger.info("Sandbox directories created")
 
             # 上传整个项目文件到沙箱 /workspace/src/（1:1 开发环境）
             _upload_project_to_sandbox(sandbox_backend)
+
+            # 将技能文件同步到常用路径，确保 agent 能通过 /src/skills/ 找到
+            sandbox_backend.execute(
+                "cp -r /workspace/src/src/skills/* /src/skills/ 2>/dev/null || true"
+            )
+            sandbox_backend.execute(
+                "cp -r /workspace/src/src/skills/* /skills/ 2>/dev/null || true"
+            )
+            agent_logger.info("Skills synced to /skills/ and /src/skills/ in sandbox")
         except Exception as init_err:
             agent_logger.warning(f"Sandbox initialization error (non-fatal): {init_err}")
 
