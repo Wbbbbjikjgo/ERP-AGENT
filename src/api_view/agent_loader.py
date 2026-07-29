@@ -38,12 +38,17 @@ class AgentLoader:
 
         web_logger.info("Initializing agent...")
         try:
-            from langgraph.checkpoint.memory import MemorySaver
-            from langgraph.store.memory import InMemoryStore
+            from langgraph.checkpoint.mongodb import MongoDBSaver
+            from .mongodb_store import MongoDBStore
+            from .web_config import MONGODB_URI, MONGODB_DB_NAME
 
-            # 开发阶段使用内存存储，生产环境替换为 MongoDB
-            self._checkpointer = MemorySaver()
-            self._store = InMemoryStore()
+            # 生产级存储：MongoDB 持久化
+            self._checkpointer = MongoDBSaver.from_conn_string(MONGODB_URI)
+            self._store = MongoDBStore(
+                uri=MONGODB_URI,
+                db_name=MONGODB_DB_NAME,
+                collection_name="langgraph_store",
+            )
 
             from ..agent.main_agent import create_main_agent
             context = ProcurementContext()
