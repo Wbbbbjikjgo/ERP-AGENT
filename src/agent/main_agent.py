@@ -3,6 +3,9 @@
 DeepAgent 核心组装 — 严格遵循 Harness Engineering 架构
 """
 import os
+import io
+import tarfile
+import fnmatch
 from typing import Optional
 from pathlib import Path
 
@@ -28,6 +31,67 @@ from .memory.prompts import MAIN_SYSTEM_PROMPT
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 SKILLS_DIR = PROJECT_ROOT / "src" / "skills"
 MEMORY_DIR = Path(__file__).parent / "memory"
+
+
+def _upload_project_to_sandbox(sandbox):
+    """
+    将项目文件上传到沙箱 /workspace/src/ 目录，搭建 1:1 开发环境。
+    跳过 node_modules / .git / __pycache__ / .next 等无关目录。
+    """
+    skip_patterns = [
+        ".git", "__pycache__", "node_modules", ".next", ".venv",
+        ".eggs", "*.pyc", "*.pyo", ".DS_Store", ".docker",
+        "*.png", "*.jpg", "*.jpeg", "*.gif",  # 生成物不传
+    ]
+
+    def _should_skip(rel_path: str) -> bool:
+        for pattern in skip_patterns:
+            if fnmatch.fnmatch(rel_path, pattern):
+                return True
+            parts = rel_path.replace("\\", "/").split("/")
+            for part in parts:
+                if fnmatch.fnmatch(part, pattern):
+                    return True
+        return False
+
+    remote_dir = "/workspace/src"
+    try:
+        sandbox.execute(f"mkdir -p '{remote_dir}'")
+
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w:gz") as tar:
+            for file_path in sorted(PROJECT_ROOT.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                rel = str(file_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+                if _should_skip(rel):
+                    continue
+                tar.add(str(file_path), arcname=rel)
+
+        tar_stream.seek(0)
+        data = tar_stream.read()
+
+        # 分块上传（tar 流一次性写入）
+        sandbox._container.put_archive(remote_dir, data)
+
+        # 获取文件数量和总大小
+        count_result = sandbox.execute(
+            f"find {remote_dir} -type f 2>/dev/null | wc -l"
+        )
+        size_result = sandbox.execute(
+            f"du -sh {remote_dir} 2>/dev/null | cut -f1"
+        )
+        file_count = count_result.output.strip() if count_result.exit_code == 0 else "?"
+        total_size = size_result.output.strip() if size_result.exit_code == 0 else "?"
+
+        agent_logger.info(
+            f"Project uploaded to sandbox: {remote_dir} "
+            f"({file_count} files, {total_size})"
+        )
+        return True
+    except Exception as e:
+        agent_logger.warning(f"Project upload to sandbox failed (non-fatal): {e}")
+        return False
 
 
 def _load_skills_prompt(skills_dir: Path) -> str:
@@ -141,12 +205,15 @@ def create_main_agent(
         sandbox_backend = DockerSandboxBackend(container_name="erp-sandbox")
         agent_logger.info("Using Docker sandbox backend (erp-sandbox)")
 
-        # ===== 沙箱初始化：创建目录 =====
+        # ===== 沙箱初始化：创建目录 + 上传项目文件 =====
         # ⚡ 注意：依赖包（matplotlib/numpy/pandas）在 chart_generator 中按需安装
         # 不在初始化时阻塞安装，避免 Agent 启动超时
         try:
             sandbox_backend.execute("mkdir -p /workspace/charts /workspace/output /workspace/data /skills")
             agent_logger.info("Sandbox directories created")
+
+            # 上传整个项目文件到沙箱 /workspace/src/（1:1 开发环境）
+            _upload_project_to_sandbox(sandbox_backend)
         except Exception as init_err:
             agent_logger.warning(f"Sandbox initialization error (non-fatal): {init_err}")
 
@@ -245,13 +312,15 @@ def create_main_agent(
         agent_logger.info(f"Skills loaded into prompt from {SKILLS_DIR}")
 
     # ===== 7. 创建 Agent =====
+    # ❌ 不传 skills 参数（框架内置 SkillsMiddleware 无法处理含中文路径）
+    # ✅ Skills 通过 _load_skills_prompt 注入 system_prompt + SkillsSyncMiddleware 同步到沙箱
     agent = create_deep_agent(
         model=llm,
         tools=all_tools,
         system_prompt=system_prompt,
         middleware=middlewares,
         subagents=subagents if subagents else None,
-        skills=[],  # 框架内置加载器路径不兼容，已通过 system_prompt 注入
+        skills=None,
         memory=[str(MEMORY_DIR / "AGENTS.md")],
         backend=backend_factory,
         interrupt_on=INTERRUPT_ON_TOOLS,
