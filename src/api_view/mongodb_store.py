@@ -17,7 +17,7 @@ from datetime import datetime
 from pymongo import MongoClient
 from langgraph.store.base import BaseStore, Item, Op
 
-from ..log_utils import web_logger
+from ..agent.log_utils import web_logger
 
 
 class MongoDBStore(BaseStore):

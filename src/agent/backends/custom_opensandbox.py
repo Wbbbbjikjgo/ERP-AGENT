@@ -408,3 +408,7 @@ class CustomOpenSandbox(BaseSandbox):
             return f"OK: uploaded {local_dir} -> {remote_dir}"
         except Exception as e:
             return f"Upload directory failed: {e}"
+
+
+# 向后兼容别名
+DockerSandboxBackend = CustomOpenSandbox

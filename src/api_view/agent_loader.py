@@ -43,7 +43,10 @@ class AgentLoader:
             from .web_config import MONGODB_URI, MONGODB_DB_NAME
 
             # 生产级存储：MongoDB 持久化
-            self._checkpointer = MongoDBSaver.from_conn_string(MONGODB_URI)
+            from pymongo import MongoClient
+            mongo_client = MongoClient(MONGODB_URI)
+            self._checkpointer = MongoDBSaver(mongo_client)
+            self._mongo_client = mongo_client
             self._store = MongoDBStore(
                 uri=MONGODB_URI,
                 db_name=MONGODB_DB_NAME,
