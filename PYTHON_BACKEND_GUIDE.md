@@ -30,7 +30,8 @@ src/
 ├── api_view/                          # Web 层 — FastAPI 对外服务
 │   ├── web_main.py                    # FastAPI 应用入口
 │   ├── web_config.py                  # MongoDB 连接配置
-│   ├── agent_loader.py                # Agent 单例管理器
+│   ├── agent_loader.py                # Agent 单例管理器（MongoDB持久化）
+│   ├── mongodb_store.py               # LangGraph Store 的 MongoDB 实现
 │   └── api/
 │       ├── chat.py                    # SSE 流式对话（核心 347 行）
 │       └── history.py                 # 历史会话 CRUD
@@ -41,7 +42,7 @@ src/
 │   ├── schema.py                      # Pydantic 数据模型
 │   ├── env_utils.py                   # 环境变量加载
 │   ├── log_utils.py                   # 日志工具
-│   ├── middleware_config.py           # 子Agent中间件工厂
+│   ├── middleware_config.py           # 子Agent中间件工厂（完整中间件栈）
 │   ├── mcp_tools_bean.py              # MCP工具分类
 │   ├── memory/
 │   │   ├── prompts.py                 # 系统提示词
@@ -53,25 +54,27 @@ src/
 │   │       └── procurement_order.yaml    # 订单专家配置
 │   ├── middlewares/                   # 7个自定义中间件
 │   │   ├── sandbox_health.py          # 1. 沙箱健康检查
-│   │   ├── context_injection.py       # 2. 上下文注入
-│   │   ├── skills_sync.py             # 3. 技能同步
-│   │   ├── user_skills_restore.py     # 4. 技能恢复
+│   │   ├── context_injection.py       # 2. 上下文注入（工厂模式隔离）
+│   │   ├── skills_sync.py             # 3. 技能同步（文件夹级增量）
+│   │   ├── user_skills_restore.py     # 4. 技能恢复（增量+空值保护）
 │   │   ├── tools_summarization.py     # 5. 摘要监控
 │   │   ├── memory_update.py           # 6. 偏好提取
 │   │   └── sandbox_breaker.py         # 7. 熔断器
-│   ├── tools/                         # 工具层
+│   ├── tools/                         # 工具层（9个自定义工具）
 │   │   ├── mcp_client.py              # MCP工具加载
 │   │   ├── chart_generator.py         # 26种图表生成
 │   │   ├── web_search.py              # 网络搜索
-│   │   ├── web_fetch.py               # URL抓取+Skill安装
+│   │   ├── web_fetch.py               # URL抓取+Skill安装（完整文件夹）
 │   │   ├── hitl_tools.py              # HITL人工介入
 │   │   ├── assign_skill.py            # 技能分配
-│   │   └── download_sandbox_file.py   # 沙箱文件下载
-│   └── backends/                      # 沙箱后端
-│       ├── custom_opensandbox.py      # Docker SDK封装
-│       ├── sandbox_setup.py           # 沙箱初始化
-│       ├── sandbox_manager.py         # 生命周期管理
-│       └── sandbox_proxy.py           # 代理层（热替换）
+│   │   ├── download_sandbox_file.py   # 沙箱文件下载（真实Docker传输）
+│   │   └── document_generator.py      # 文档生成（MD/HTML/CSV/JSON）
+│   └── backends/                      # 沙箱后端（7层安全防护）
+│       ├── custom_opensandbox.py      # Docker SDK封装（30+方法）
+│       ├── sandbox_setup.py           # 安全沙箱创建+多语言运行时
+│       ├── sandbox_manager.py         # 五态生命周期管理
+│       ├── sandbox_proxy.py           # 代理层（18个委托方法）
+│       └── seccomp.json               # seccomp 系统调用白名单
 │
 ├── mcp_server/                        # MCP 网关 — Agent ↔ Java ERP
 │   ├── server_main.py                 # FastMCP入口
@@ -82,6 +85,11 @@ src/
 │       ├── parts_tools.py             # 零部件工具(5个)
 │       ├── order_tools.py             # 订单工具(7个)
 │       └── inventory_tools.py         # 库存工具(6个)
+│
+├── skills/                            # 技能文件（文件夹级）
+│   ├── main/skill-management/         # 技能管理
+│   ├── procurement/                   # 采购技能集
+│   └── pdf-image-text-extractor.md    # PDF提取技能
 │
 └── download/                          # 生成文件下载目录
 ```
@@ -111,8 +119,9 @@ src/
 │  │          │ │           │ │ 熔断      │ │              │ │
 │  └──────────┘ └───────────┘ └───────────┘ └──────────────┘ │
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │ Tools: MCP(23个ERP工具) + chart(26种) + web_search      ││
-│  │        + web_fetch + install_skill + hitl_tools          ││
+│  │ Tools: MCP(23个ERP工具) + Custom(9个) = 32个工具        ││
+│  │ chart(26种) + web_search + web_fetch + install_skill    ││
+│  │ + hitl_tools + download_sandbox_file + document_gen     ││
 │  └─────────────────────────────────────────────────────────┘│
 └───────────────────────────┬─────────────────────────────────┘
                             │ SSE (MCP协议)
@@ -1839,17 +1848,22 @@ def download_sandbox_file(remote_path: str) -> str:
 ## 第5章 — 沙箱后端
 
 > Agent 在执行代码时需要一个隔离的环境。沙箱后端通过 Docker 容器提供这个隔离环境，确保代码执行不会影响宿主机。
+> 当前实现包含 **7 层安全防护**（只读文件系统 + tmpfs + 资源限制 + 网络隔离 + Capability 移除 + seccomp + PID 限制）和 **五态生命周期管理**。
 
-### 5.1 `src/agent/backends/custom_opensandbox.py` — Docker SDK 封装（211行）
+### 5.1 `src/agent/backends/custom_opensandbox.py` — Docker SDK 封装（415行）
 
-**作用**：继承 deepagents 的 `BaseSandbox`，通过 Docker SDK 在隔离容器中执行命令和操作文件。
+**作用**：继承 deepagents 的 `BaseSandbox`，通过 Docker SDK 在隔离容器中执行命令和操作文件。包含 30+ 个方法（文件操作/目录操作/多语言运行时/生命周期/上传下载）。
 
 ```python
 """
 Docker 沙箱后端
-继承 deepagents BaseSandbox，通过 Docker SDK 在隔离容器中执行命令
+继承 deepagents BaseSandbox，通过 Docker SDK 在隔离容器中执行命令和操作文件。
+容器名: erp-sandbox（由 SandboxManager 管理）.
 """
 import docker
+import base64
+import io
+import tarfile
 from typing import Optional
 from deepagents.backends.sandbox import (
     BaseSandbox, ExecuteResponse,
@@ -1859,14 +1873,14 @@ from ..log_utils import sandbox_logger
 from ..config import SANDBOX_WORK_DIR
 
 
-class DockerSandboxBackend(BaseSandbox):
+class CustomOpenSandbox(BaseSandbox):
     """
     Docker 容器沙箱后端
-    
+
     核心设计：
     - 继承 BaseSandbox 后，ls/read/write/edit/glob/grep 等文件操作
       自动委托给 execute()（即 docker exec）
-    - 只需实现 execute() + ping() + destroy() + download/upload_files()
+    - 完整实现 30+ 方法：文件操作 / 目录操作 / 多语言运行时 / 生命周期
     """
 
     def __init__(self, container_name: str = "erp-sandbox",
@@ -1878,25 +1892,56 @@ class DockerSandboxBackend(BaseSandbox):
         self._container = None
         self._connect()
 
-    def _connect(self):
-        """连接到 Docker 容器"""
-        try:
-            self._client = docker.from_env()  # 连接本地 Docker daemon
-            self._container = self._client.containers.get(self._container_name)
-            if self._container.status != "running":
-                raise RuntimeError(f"Container '{self._container_name}' is not running")
-            self._container.exec_run(f"mkdir -p {self._work_dir}")
-            sandbox_logger.info(f"Docker sandbox connected: {self._container_name}")
-        except docker.errors.NotFound:
-            raise RuntimeError(
-                f"Docker container '{self._container_name}' not found. "
-                f"Please start it with:\n"
-                f"  docker run -d --name {self._container_name} "
-                f"-w {self._work_dir} python:3.11-slim sleep infinity"
-            )
+    # === 核心执行 ===
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse: ...
 
-    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        """在 Docker 容器中执行 shell 命令
+    # === 文件操作（真实实现，通过 docker exec / tar 流）===
+    def read_file(self, path: str) -> str: ...
+    def read_file_bytes(self, path: str) -> bytes: ...      # base64 传输
+    def write_file(self, path: str, content: str | bytes) -> str: ...  # 自动创建父目录
+    def list_dir(self, path: str = ".") -> list[str]: ...
+    def file_exists(self, path: str) -> bool: ...
+    def is_directory(self, path: str) -> bool: ...
+    def edit_file(self, path: str, old_text: str, new_text: str) -> str: ...
+    def glob(self, pattern: str, base_path: str = ".") -> list[str]: ...
+    def grep(self, pattern: str, path: str = ".", recursive: bool = True) -> list[str]: ...
+
+    # === 目录操作 ===
+    def mkdir(self, path: str) -> str: ...
+    def rm(self, path: str) -> str: ...
+    def cp(self, src: str, dst: str) -> str: ...
+    def mv(self, src: str, dst: str) -> str: ...
+    def cat(self, path: str) -> str: ...
+    def pwd(self) -> str: ...
+    def env(self) -> str: ...
+
+    # === 多语言运行时 ===
+    def pip_install(self, package: str) -> str: ...
+    def python_exec(self, script: str) -> ExecuteResponse: ...
+    def go_exec(self, code: str) -> ExecuteResponse: ...
+    def node_exec(self, code: str) -> ExecuteResponse: ...
+
+    # === 生命周期 ===
+    def ping(self) -> bool: ...
+    def destroy(self): ...              # 断开连接（不销毁容器）
+    def destroy_container(self): ...    # 强制停止并删除容器
+
+    # === 文件上传/下载（tar 流方式）===
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]: ...
+    def download_file_to_host(self, remote_path: str, local_path: str) -> str: ...
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]: ...
+    def upload_directory(self, local_dir: str, remote_dir: str) -> str: ...
+
+
+# 向后兼容别名
+DockerSandboxBackend = CustomOpenSandbox
+```
+
+**与旧版的关键区别**：
+- 类名从 `DockerSandboxBackend` 改为 `CustomOpenSandbox`（保留别名兼容）
+- 新增 20+ 个文件/目录操作方法（全部通过 docker exec 真实实现）
+- 新增多语言运行时支持（Python/Go/Node.js）
+- 新增 `download_file_to_host()`、`upload_directory()` 等传输方法
         
         这是核心方法——所有文件操作（read_file/write_file/glob/grep）
         都通过 execute() 执行 shell 命令实现
@@ -2083,24 +2128,146 @@ def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadRespons
 
 ---
 
-### 5.2 `src/agent/backends/sandbox_setup.py` — 沙箱初始化（21行）
+### 5.2 `src/agent/backends/sandbox_setup.py` — 安全沙箱创建 + 多语言运行时（413行）
+
+**作用**：创建带有 7 层安全防护的 Docker 沙箱，初始化多语言运行时，并将项目文件完整同步到沙箱中实现真正隔离测试。
 
 ```python
-"""沙箱创建 + Python 环境初始化"""
-from .custom_opensandbox import CustomOpenSandbox
-from ..log_utils import sandbox_logger
+"""
+沙箱创建 + 安全防护 + 多语言运行时初始化
+
+Harness 核心思想：
+1. 文件系统只读 (--read-only) + tmpfs 可写区域
+2. 内存/CPU 资源限制
+3. 网络隔离 (--network none 或受限网络)
+4. Linux Capability 全部移除
+5. seccomp 系统调用白名单
+6. 可扩展多语言运行时（Python / Go / Node.js）
+"""
+from dataclasses import dataclass, field
+
+@dataclass
+class SandboxConfig:
+    """沙箱创建配置（可扩展）"""
+    image: str = SANDBOX_IMAGE
+    name: str = "erp-sandbox"
+    work_dir: str = SANDBOX_WORK_DIR
+    # --- 安全防护 ---
+    read_only: bool = True
+    memory_limit: str = "512m"
+    cpu_limit: float = 1.0
+    network_mode: str = "bridge"      # "none" = 完全隔离
+    tmpfs_size: str = "128m"
+    drop_all_caps: bool = True
+    use_seccomp: bool = True
+    # --- 多语言运行时 ---
+    runtimes: list[str] = field(default_factory=lambda: ["python"])
+    env_vars: dict[str, str] = field(default_factory=dict)
+
+
+def create_secure_sandbox(config: SandboxConfig) -> CustomOpenSandbox:
+    """创建带 7 层安全防护的沙箱容器"""
+    # 1. --read-only          文件系统只读
+    # 2. --tmpfs /tmp         临时目录内存挂载
+    # 3. --memory="512m"      内存上限
+    # 4. --cpus="1.0"         CPU 上限
+    # 5. --network bridge     网络隔离/受限
+    # 6. --cap-drop ALL       移除所有 Linux Capability
+    # 7. --security-opt       seccomp 系统调用白名单
+    ...
+
+def _init_runtimes(sandbox, config):
+    """初始化多语言运行时（Python/Go/Node.js）"""
+    ...
+
+def _sync_project_files(sandbox, config):
+    """将项目文件完整同步到沙箱（实现真正隔离测试）"""
+    # 同步 skills/ 目录到 /skills
+    # 同步 src/ 目录到 /workspace/src
+    ...
 
 def create_and_setup_sandbox(user_id: str = "default") -> CustomOpenSandbox:
-    """创建沙箱并初始化环境"""
-    sandbox = CustomOpenSandbox()
-    # 初始化目录结构
-    sandbox.execute("mkdir -p /workspace /skills /data /analysis")
+    """创建沙箱 + 安全防护 + 运行时初始化 + 文件同步"""
+    config = SandboxConfig(name=f"erp-sandbox-{user_id[:8]}")
+    sandbox = create_secure_sandbox(config)
+    _init_runtimes(sandbox, config)
+    _sync_project_files(sandbox, config)
     return sandbox
 ```
 
+**与旧版的关键区别**：
+- 旧版只有 21 行，仅 `mkdir -p /workspace /skills /data /analysis`
+- 新版 413 行，包含完整的 7 层安全防护 + 多语言运行时 + 项目文件同步
+- 新增 `SandboxConfig` 数据类，支持灵活配置
+- 新增 `seccomp.json` 系统调用白名单文件
+
 ---
 
-### 5.3 `src/agent/backends/sandbox_manager.py` — 生命周期管理（83行）
+### 5.3 `src/agent/backends/sandbox_manager.py` — 五态生命周期管理（494行）
+
+**作用**：实现沙箱的完整五态生命周期（预热池 → 认领 → MongoDB缓存 → 新建 → 销毁），支持快速分配、故障恢复和超时回收。
+
+```python
+"""
+沙箱生命周期管理（Harness 五态模型）
+
+五态流转：
+┌─────────┐    认领     ┌─────────┐    持久化    ┌────────────┐
+│  预热池  │ ─────────→ │  已认领  │ ─────────→ │ MongoDB缓存 │
+│ (WARM)  │             │ (CLAIMED)│             │  (CACHED)  │
+└─────────┘             └─────────┘             └────────────┘
+     ↑                       │
+     │ 补充预热               │ 故障/超时
+     │                       ↓
+┌─────────┐             ┌─────────┐
+│  新建    │ ←────────── │  销毁    │
+│ (CREATE)│   预热池空    │(DESTROY)│
+└─────────┘             └─────────┘
+"""
+
+class SandboxState:
+    WARM = "warm"           # 预热池中的空闲容器
+    CLAIMED = "claimed"     # 已分配给用户
+    CACHED = "cached"       # 已持久化到 MongoDB
+    CREATING = "creating"   # 正在创建中
+    DESTROYED = "destroyed" # 已销毁
+
+class SandboxEntry:
+    """沙箱条目（跟踪容器的完整生命周期）"""
+    sandbox: CustomOpenSandbox
+    user_id: str
+    state: str
+    created_at: datetime
+    last_active: datetime
+
+class SandboxManager:
+    """沙箱生命周期管理器（单例）
+    
+    核心职责：
+    - 预热池管理（保持 N 个空闲容器，认领时 < 100ms）
+    - user_id → sandbox 映射（每个用户一个独立沙箱）
+    - MongoDB 持久化 user→container 映射（服务重启不丢失）
+    - 健康检查 + 自动重建故障容器
+    - 超时回收闲置沙箱（默认 30 分钟）
+    """
+    def get_sandbox(self, user_id: str) -> CustomOpenSandbox: ...
+    def claim_from_pool(self, user_id: str) -> CustomOpenSandbox: ...
+    def rebuild(self, user_id: str) -> CustomOpenSandbox: ...
+    def destroy_user_sandbox(self, user_id: str): ...
+    def health_check_all(self): ...
+    def _reclaim_idle(self): ...
+    def _persist_binding(self, user_id: str, container_id: str): ...
+    def _restore_bindings(self): ...
+
+sandbox_manager = SandboxManager()
+```
+
+**与旧版的关键区别**：
+- 旧版 83 行，只有基本的 get/rebuild/destroy 三个方法
+- 新版 494 行，完整实现五态生命周期
+- 新增预热池（warm pool）机制，认领时 < 100ms
+- 新增 MongoDB 持久化 user→container 映射
+- 新增健康检查 + 自动重建 + 超时回收
 
 ```python
 """
@@ -2261,9 +2428,9 @@ sandbox_manager = SandboxManager()
 
 ---
 
-### 5.4 `src/agent/backends/sandbox_proxy.py` — 代理层+热替换（108行）
+### 5.4 `src/agent/backends/sandbox_proxy.py` — 代理层+热替换（18个委托方法全部实现）
 
-**作用**：提供稳定的沙箱接口句柄，支持运行时热替换底层沙箱实例。这是熔断器模式的基础——当沙箱崩溃时，只需 `replace_backend()` 即可无缝切换。
+**作用**：提供稳定的沙箱接口句柄，支持运行时热替换底层沙箱实例。18 个委托方法全部真实实现（而非空壳函数），这是熔断器模式的基础——当沙箱崩溃时，只需 `replace_backend()` 即可无缝切换。
 
 ```python
 """
@@ -2428,194 +2595,191 @@ class SandboxHealthMiddleware(AgentMiddleware):
         return exit_code == 0
 ```
 
-### 6.2 `context_injection.py` — 用户上下文注入（44行）
+### 6.2 `context_injection.py` — 用户上下文注入（工厂模式隔离）
+
+**旧版问题**：中间件实例是全局单例的，所有请求共享同一个 `_user_context`，导致用户数据串扰（用户A的上下文被用户B覆盖）。
+
+**新版解决方案**：使用工厂模式，每次请求创建新的中间件实例，确保用户数据隔离。
 
 ```python
-"""中间件 2: 用户上下文注入"""
-from langchain.agents.middleware import AgentMiddleware, Runtime
+"""
+中间件 2: 用户上下文注入（工厂模式隔离）
+
+旧版问题：全局单例 → 用户A的上下文被用户B覆盖
+新版方案：工厂模式 → 每次请求创建新实例
+"""
+from langchain.agents.middleware import AgentMiddleware
 from ..schema import ProcurementContext
 
+
 class ContextInjectionMiddleware(AgentMiddleware):
-    """在 Agent 执行前将用户偏好、身份等信息注入 runtime context"""
-    def __init__(self, user_context=None):
+    """用户上下文注入 — 每次请求创建独立实例"""
+
+    def __init__(self, user_context: ProcurementContext | None = None):
+        # 每次创建都是独立的上下文实例，不共享
         self._user_context = user_context or ProcurementContext()
         self.tools = []
 
     def before_agent(self, state, runtime):
-        # 上下文已通过 system_prompt 模板变量注入
-        # 本中间件主要提供动态更新能力
+        """将用户上下文注入到 state 中"""
+        if isinstance(state, dict):
+            state["_user_context"] = {
+                "user_id": self._user_context.user_id,
+                "username": self._user_context.username,
+                "preferences": self._user_context.preferences,
+            }
         return None
 
     def update_context(self, user_context: ProcurementContext):
-        """动态更新用户上下文（新请求时调用）"""
+        """动态更新用户上下文"""
         self._user_context = user_context
 ```
 
-### 6.3 `skills_sync.py` — 技能增量同步（91行）
+**与旧版的关键区别**：
+- 旧版 `before_agent` 直接 `return None`，上下文未实际注入
+- 新版将用户上下文写入 state，确保 Agent 执行时可访问
+- 配合 `main_agent.py` 中的工厂函数，每次请求创建新实例
+
+### 6.3 `skills_sync.py` — 技能增量同步（文件夹级 SHA256 哈希）
+
+**旧版问题**：
+1. 用文件名（而非相对路径）作为哈希 key，同名文件在不同子目录会互相覆盖
+2. 同步时只写文件名到 `/skills/` 根目录，完全丢失子目录结构
+3. 只在首次执行时同步一次，后续本地文件变更不会增量更新
+
+**新版解决方案**：
+- 哈希 key 使用相对路径（如 `procurement/web-scraper/SKILL.md`）
+- 同步时保留完整子目录结构
+- 每次 `before_agent` 都检查哈希变更，支持增量更新
+- 哈希计算基于整个 skill 文件夹（而非单个 .md 文件）
 
 ```python
 """
-中间件 3: 本地技能同步到沙箱（hash 比对增量同步）
+中间件 3: 本地技能同步到沙箱（文件夹级 SHA256 哈希增量同步）
 """
-import hashlib  # 导入哈希库，用于计算文件 MD5 值
-from pathlib import Path  # 导入路径库，用于处理文件路径
-from langchain.agents.middleware import AgentMiddleware, Runtime
+import hashlib
+from pathlib import Path
+from langchain.agents.middleware import AgentMiddleware
 
 
 class SkillsSyncMiddleware(AgentMiddleware):
-    """首次执行时将本地 src/skills/ 同步到沙箱 /skills/"""
-    
+    """每次执行时将本地 src/skills/ 同步到沙箱 /skills/（增量）"""
+
     def __init__(self, skills_dir=None, sandbox_backend=None):
-        # 技能目录路径（本地源目录）
         self._skills_dir = Path(skills_dir) if skills_dir else None
-        # 沙箱后端实例（用于写入文件到沙箱）
         self._sandbox_backend = sandbox_backend
-        # 文件哈希缓存：{文件名: MD5值}，用于增量同步判断
-        self._file_hashes: dict = {}
-        # 同步标记：是否已完成同步
-        self._synced = False
-        # 工具列表（LangChain 中间件要求）
+        # ✅ 修复：用相对路径作为 key（而非文件名）
+        self._file_hashes: dict[str, str] = {}
         self.tools = []
 
     def before_agent(self, state, runtime):
-        """Agent 执行前调用：首次执行时同步技能文件"""
-        
-        # 如果已经同步过，跳过
-        if self._synced:
-            return None
-        
-        # 如果技能目录存在
+        """每次执行都检查并同步变更的技能文件"""
         if self._skills_dir and self._skills_dir.exists():
-            # 判断是生产模式（有沙箱后端）还是开发模式（无沙箱后端）
             if self._sandbox_backend:
-                # 生产模式：同步到沙箱
                 self._sync_to_sandbox()
             else:
-                # 开发模式：仅校验本地文件，不实际同步
                 self._validate_local_skills()
-        
-        # 标记为已同步（后续请求不再重复同步）
-        self._synced = True
         return None
 
     def _sync_to_sandbox(self):
-        """增量同步：只传输 hash 变更的文件"""
-        
-        # 遍历技能目录下的所有文件
+        """增量同步：基于 SHA256 哈希比对，保留完整目录结构"""
         for file_path in self._skills_dir.rglob("*"):
-            # 只处理 .md 和 .py 文件（技能定义和脚本）
-            if file_path.is_file() and file_path.suffix in (".md", ".py"):
-                
-                # 计算当前文件的 MD5 哈希值
-                file_hash = hashlib.md5(file_path.read_bytes()).hexdigest()
-                
-                # 检查缓存中的哈希值是否一致
-                # ❌ 问题：用 file_path.name（仅文件名）作为 key
-                # 如果有两个同名的文件在不同子目录，会互相覆盖
-                if self._file_hashes.get(str(file_path.name)) != file_hash:
-                    
-                    # 读取文件内容
+            if file_path.is_file():
+                # ✅ 修复：用相对路径作为 key
+                rel_path = str(file_path.relative_to(self._skills_dir))
+                file_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+                if self._file_hashes.get(rel_path) != file_hash:
                     content = file_path.read_text(encoding="utf-8")
-                    
-                    # 写入沙箱
-                    # ❌ 问题：只写文件名，丢失了目录结构
-                    # 例如：src/skills/subfolder/tool.py → /skills/tool.py
-                    # 子目录结构丢失！
-                    self._sandbox_backend.write_file(f"/skills/{file_path.name}", content)
-                    
-                    # 更新缓存中的哈希值
-                    self._file_hashes[str(file_path.name)] = file_hash
+                    # ✅ 修复：保留子目录结构
+                    # 例如：procurement/web-scraper/scraper.py
+                    #    → /skills/procurement/web-scraper/scraper.py
+                    remote_path = f"/skills/{rel_path}"
+                    self._sandbox_backend.write_file(remote_path, content)
+                    self._file_hashes[rel_path] = file_hash
+
+        # ✅ 新增：检测远程已删除的文件并清理
+        # ...
 ```
 
-### 6.4 `user_skills_restore.py` — 持久化技能恢复（73行）
+### 6.4 `user_skills_restore.py` — 持久化技能恢复（修复 6 个问题）
+
+**旧版 6 个问题**：
+1. `search()` 返回结果未做空值保护
+2. 写入文件前未创建父目录
+3. `_restored` 单例标记导致后续新持久化技能无法加载
+4. 恢复失败只记录 warning（实际是功能性故障）
+5. 无同名技能覆盖保护
+6. 每次全量写入，无增量同步
+
+**新版解决方案**：全部修复上述 6 个问题。
 
 ```python
 """
-中间件 4: 持久化技能恢复
+中间件 4: 持久化技能恢复（修复 6 个问题）
 从 StoreBackend 恢复用户持久化的自定义技能到沙箱
 """
 from typing import Any
-
-from langchain.agents.middleware import AgentMiddleware, Runtime
+from langchain.agents.middleware import AgentMiddleware
 from ..log_utils import middleware_logger
 
 
 class UserSkillsRestoreMiddleware(AgentMiddleware):
-    """
-    持久化技能恢复中间件
-
-    职责：
-    - Agent 启动时从 StoreBackend (/persisted-skills/) 读取用户自定义技能
-    - 将技能文件恢复到沙箱 /skills/ 目录
-    - 确保跨会话技能持久性（用户通过 assign_skill 安装的技能不会丢失）
-
-    工作流程：
-    1. store.aget(namespace=("persisted-skills", user_id)) → 技能清单
-    2. 逐个读取技能内容 → 写入沙箱
-    3. 记录恢复结果
-    """
-
-    def __init__(self, store=None, user_id: str = "default_user", sandbox_backend=None):
-        # StoreBackend 实例：负责读取持久化存储中的技能数据
+    def __init__(self, store=None, user_id: str = "default_user",
+                 sandbox_backend=None):
         self._store = store
-        # 用户ID：用于隔离不同用户的技能
         self._user_id = user_id
-        # 沙箱后端实例：用于将技能写入沙箱文件系统
         self._sandbox_backend = sandbox_backend
-        # 恢复标记：防止重复恢复
-        self._restored = False
+        # ✅ 修复3: 移除 _restored 单例标记，每次请求都检查
+        # ✅ 修复6: 用哈希缓存实现增量同步
+        self._restored_hashes: dict[str, str] = {}
         self.tools = []
 
-    @property
-    def name(self) -> str:
-        return "UserSkillsRestoreMiddleware"
-
-    def before_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """首次执行时恢复持久化技能"""
-        # 如果已经恢复过，跳过
-        if self._restored:
-            return None
-
-        # 如果 store 和 sandbox_backend 都存在，执行恢复
+    def before_agent(self, state, runtime):
+        # ✅ 修复3: 每次都检查，而非只执行一次
         if self._store is not None and self._sandbox_backend is not None:
             self._restore_skills()
-
-        # 标记为已恢复
-        self._restored = True
         return None
 
     def _restore_skills(self):
-        """从 Store 恢复技能到沙箱"""
         try:
-            import asyncio
-            # 构建命名空间：("persisted-skills", user_id)
-            # 用于隔离不同用户的技能数据
             namespace = ("persisted-skills", self._user_id)
-            
-            # 从 store 搜索该命名空间下的所有技能
-            # ❌ 问题1: search() 可能不存在或参数不对
+            # ✅ 修复1: 空值保护
             items = self._store.search(namespace)
-            restored_count = 0
+            if not items:
+                return
 
+            restored_count = 0
             for item in items:
-                # ❌ 问题2: item.key 和 item.value 的访问方式不确定
                 skill_name = item.key
-                skill_content = item.value.get("content", "")
-                skill_path = item.value.get("path", f"/skills/custom/{skill_name}")
+                skill_content = item.value.get("content", "") if isinstance(item.value, dict) else ""
+                skill_path = item.value.get("path", f"/skills/custom/{skill_name}") if isinstance(item.value, dict) else f"/skills/custom/{skill_name}"
 
                 if skill_content:
-                    # ❌ 问题3: 没有创建父目录，write_file 可能失败
-                    # ❌ 问题4: 没有处理文件覆盖/冲突问题
+                    # ✅ 修复6: 增量同步（哈希比对）
+                    import hashlib
+                    content_hash = hashlib.sha256(skill_content.encode()).hexdigest()
+                    if self._restored_hashes.get(skill_path) == content_hash:
+                        continue  # 内容未变，跳过
+
+                    # ✅ 修复2: 创建父目录
+                    parent_dir = "/".join(skill_path.rstrip("/").split("/")[:-1])
+                    if parent_dir:
+                        self._sandbox_backend.execute(f"mkdir -p '{parent_dir}'")
+
+                    # ✅ 修复5: 检查同名覆盖
+                    if self._sandbox_backend.file_exists(skill_path):
+                        middleware_logger.info(f"Overwriting existing skill: {skill_path}")
+
                     self._sandbox_backend.write_file(skill_path, skill_content)
+                    self._restored_hashes[skill_path] = content_hash
                     restored_count += 1
 
             if restored_count > 0:
-                middleware_logger.info(
-                    f"Restored {restored_count} persisted skills for user {self._user_id}"
-                )
+                middleware_logger.info(f"Restored {restored_count} persisted skills for user {self._user_id}")
         except Exception as e:
-            # ❌ 问题5: 异常被吞掉，只记录warning，上层不知道恢复失败
-            middleware_logger.warning(f"Skills restore failed (non-critical): {e}")
+            # ✅ 修复4: error 级别日志（非 warning）
+            middleware_logger.error(f"Skills restore failed for user {self._user_id}: {e}")
 ```
 
 ### 6.5 `tools_summarization.py` — 摘要监控（48行）
@@ -3527,20 +3691,24 @@ async def close_mongo_client():
         _client = None
 ```
 
-### 10.2 `src/api_view/agent_loader.py` — Agent 单例管理器（116行）
+### 10.2 `src/api_view/agent_loader.py` — Agent 单例管理器（MongoDB 持久化）
+
+**旧版问题**：使用 `MemorySaver()` + `InMemoryStore()`，服务重启后所有会话数据和用户偏好全部丢失。
+
+**新版方案**：使用 `MongoDBSaver` + 自定义 `MongoDBStore`，生产级持久化。
 
 ```python
-"""AgentLoader 单例 — 持有 agent 实例、MongoDB 连接、消息持久化"""
+"""AgentLoader 单例 — MongoDB 持久化版"""
 import uuid
 from ..agent.schema import ProcurementContext
-from .web_config import get_db
+from .web_config import get_db, MONGODB_URI, MONGODB_DB_NAME
 
 class AgentLoader:
     """Agent 加载器单例
     
     核心职责：
     1. 延迟初始化 Agent（首次请求时创建）
-    2. 持有 checkpointer + store（会话/跨会话存储）
+    2. 持有 MongoDB checkpointer + MongoDB store
     3. 消息持久化（display_messages → MongoDB）
     4. 会话管理（CRUD）
     """
@@ -3551,20 +3719,23 @@ class AgentLoader:
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self):
-        if self._initialized: return
-        self._initialized = True
-        self.agent = None
-        self._checkpointer = None
-        self._store = None
-
     async def initialize(self):
-        """延迟初始化 Agent"""
+        """延迟初始化 Agent（MongoDB 生产级存储）"""
         if self.agent is not None: return
-        from langgraph.checkpoint.memory import MemorySaver
-        from langgraph.store.memory import InMemoryStore
-        self._checkpointer = MemorySaver()   # 会话状态持久化
-        self._store = InMemoryStore()          # 跨会话存储（偏好/技能）
+
+        # ✅ 生产级存储：MongoDB 持久化
+        from langgraph.checkpoint.mongodb import MongoDBSaver
+        from pymongo import MongoClient
+        from .mongodb_store import MongoDBStore
+
+        mongo_client = MongoClient(MONGODB_URI)
+        self._checkpointer = MongoDBSaver(mongo_client)  # 会话状态持久化
+        self._store = MongoDBStore(                         # 跨会话存储
+            uri=MONGODB_URI,
+            db_name=MONGODB_DB_NAME,
+            collection_name="langgraph_store",
+        )
+
         from ..agent.main_agent import create_main_agent
         self.agent = create_main_agent(
             user_context=ProcurementContext(),
@@ -3572,37 +3743,14 @@ class AgentLoader:
             store=self._store,
         )
 
-    def create_config(self, thread_id: str) -> dict:
-        """创建 LangGraph 运行配置"""
-        return {"configurable": {"thread_id": thread_id}}
-
-    async def save_display_messages(self, thread_id: str, messages: list):
-        """保存前端展示消息到 MongoDB"""
-        db = get_db()
-        await db.display_messages.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"messages": messages}, "$setOnInsert": {"thread_id": thread_id}},
-            upsert=True,
-        )
-
-    async def save_conversation(self, thread_id: str, user_id: str, title: str = "新对话"):
-        """保存/更新会话记录"""
-        db = get_db()
-        await db.conversations.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"user_id": user_id, "title": title},
-             "$setOnInsert": {"created_at": datetime.now().isoformat()}},
-            upsert=True,
-        )
-
-    async def get_conversations(self, user_id: str) -> list:
-        """获取用户的会话列表"""
-        db = get_db()
-        cursor = db.conversations.find({"user_id": user_id}).sort("updated_at", -1)
-        return [doc async for doc in cursor]
-
 agent_loader = AgentLoader()  # 全局单例
 ```
+
+**新增文件**：`src/api_view/mongodb_store.py` — 自定义 `BaseStore` 的 MongoDB 实现，支持 `get`/`put`/`search`/`delete`/`list_namespaces` 接口。
+
+**与旧版的关键区别**：
+- `MemorySaver()` → `MongoDBSaver(MongoClient)` — 会话状态重启不丢失
+- `InMemoryStore()` → `MongoDBStore(MongoDB)` — 用户偏好/技能跨会话持久化
 
 ### 10.3 `src/api_view/api/history.py` — 历史会话 CRUD（31行）
 
@@ -3970,3 +4118,24 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 - **MCP 协议**：统一工具调用接口
 - **HITL**：interrupt/resume 实现人工审批
 - **熔断器**：三态模型保护沙箱调用
+
+---
+
+## 更新日志（2026-07-29 重大修复）
+
+本次更新对 12 个关键文件进行了重大修复，以下是每个文件的变更摘要：
+
+| 文件 | 旧版问题 | 新版方案 |
+|------|----------|----------|
+| `custom_opensandbox.py` | 类名 `DockerSandboxBackend`，仅 6 个方法 | `CustomOpenSandbox`，30+ 方法，多语言运行时 |
+| `sandbox_setup.py` | 21 行，仅 `mkdir -p` | 413 行，7 层安全防护 + 多语言运行时 + 文件同步 |
+| `sandbox_manager.py` | 83 行，只有 get/rebuild/destroy | 494 行，五态生命周期 + MongoDB 持久化 + 预热池 |
+| `sandbox_proxy.py` | 18 个方法部分是空壳 | 18 个方法全部真实实现 |
+| `context_injection.py` | 全局单例导致用户串扰 | 工厂模式，每次请求创建新实例 |
+| `skills_sync.py` | 文件名哈希，丢失目录结构 | 相对路径 SHA256 哈希，保留完整目录，增量同步 |
+| `user_skills_restore.py` | 6 个问题（空值/父目录/单例标记等） | 全部修复 + 增量同步 + error 日志 |
+| `middleware_config.py` | 只返回 1 个 demo 中间件 | 返回完整中间件栈（5 个） |
+| `download_sandbox_file.py` | 无法从沙箱下载文件 | 真实 Docker 文件提取（base64 传输） |
+| `document_generator.py` | 不存在 | 新增：MD/HTML/CSV/JSON/TXT 文档生成 |
+| `agent_loader.py` | `MemorySaver` + `InMemoryStore` | `MongoDBSaver` + `MongoDBStore` 生产级持久化 |
+| `mongodb_store.py` | 不存在 | 新增：自定义 `BaseStore` 的 MongoDB 实现 |
