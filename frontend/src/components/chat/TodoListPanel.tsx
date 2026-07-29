@@ -20,13 +20,24 @@ export default function TodoListPanel({ items, visible }: Props) {
   const [open, setOpen] = useState(true);
 
   if (!visible || items.length === 0) return null;
-  if (!open) return null;
 
   const completedCount = items.filter((i) => i.status === "complete").length;
   const progress = items.length > 0 ? (completedCount / items.length) * 100 : 0;
 
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="fixed top-14 right-4 z-[9999] flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white border border-gray-200 shadow-sm hover:bg-gray-50 transition-colors text-xs text-gray-600 animate-fade-in"
+      >
+        <ListTodo size={14} className="text-blue-600" />
+        <span>{completedCount}/{items.length}</span>
+      </button>
+    );
+  }
+
   return (
-    <div className="fixed top-2 right-4 w-72 z-[9999] rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
+    <div className="fixed top-14 right-4 w-72 z-[9999] rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden animate-fade-in">
       <div className="flex items-center justify-between px-4 py-2.5 bg-gray-50/80 border-b border-gray-100">
         <div className="flex items-center gap-2">
           <ListTodo size={14} className="text-blue-600" />
@@ -39,6 +50,7 @@ export default function TodoListPanel({ items, visible }: Props) {
           <button
             onClick={() => setOpen(false)}
             className="p-0.5 hover:bg-gray-200 rounded transition-colors"
+            title="收起"
           >
             <X size={14} className="text-gray-400" />
           </button>
