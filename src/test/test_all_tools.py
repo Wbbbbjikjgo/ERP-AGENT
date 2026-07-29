@@ -19,15 +19,10 @@ async def test_chart_generator():
 
     result = await generate_chart.ainvoke({
         "chart_type": "bar",
-        "data": [
-            {"name": "供应商A", "value": 100},
-            {"name": "供应商B", "value": 150},
-            {"name": "供应商C", "value": 80},
-        ],
+        "data": '[{"name": "供应商A", "value": 100}, {"name": "供应商B", "value": 150}, {"name": "供应商C", "value": 80}]',
         "title": "测试柱状图",
         "x_field": "name",
         "y_field": "value",
-        "filename": "test_bar",
     })
     print(f"    结果: {str(result)[:150]}")
     print("    ✓ chart_generator 正常\n")

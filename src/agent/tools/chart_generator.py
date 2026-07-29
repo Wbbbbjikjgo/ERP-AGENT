@@ -1,23 +1,20 @@
 """
-图表生成工具
-26种图表类型合并为单一工具，在本地执行 matplotlib 脚本生成 PNG
+图表生成工具（Harness — 沙箱内安全执行）
+26种图表类型合并为单一工具，在 Docker 沙箱内执行 matplotlib 生成 PNG。
 
-生产级实现：
-- 支持 x_field / y_field / series_field 灵活数据映射
-- 数据通过临时 JSON 文件传递（避免 shell 转义问题）
-- 自动中文字体配置
-- 超时保护 + 错误隔离
+核心设计（Harness 思想）：
+- 所有图表必须在 Docker 沙箱内生成（/workspace/charts/）
+- 用户需要下载时，通过 download_sandbox_file 工具从沙箱提取到本地
+- 沙箱不可用时返回错误，不降级到宿主机执行
 """
-import os
 import json
-import tempfile
-import subprocess
+from datetime import datetime
 from pathlib import Path
 from langchain_core.tools import tool
 
 from ..log_utils import agent_logger
+from ..backends.sandbox_holder import get_sandbox
 
-# 支持的26种图表类型
 CHART_TYPES = [
     "bar", "horizontal_bar", "stacked_bar", "grouped_bar",
     "line", "multi_line", "area", "stacked_area",
@@ -32,7 +29,6 @@ CHART_TYPES = [
     "sankey",
 ]
 
-# 图表生成脚本（从文件读取数据，避免转义问题）
 CHART_SCRIPT = '''
 import matplotlib
 matplotlib.use('Agg')
@@ -42,7 +38,6 @@ import json
 import sys
 import os
 
-# 中文字体配置
 for font in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']:
     try:
         plt.rcParams['font.sans-serif'] = [font]
@@ -51,7 +46,6 @@ for font in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']:
         continue
 plt.rcParams['axes.unicode_minus'] = False
 
-# 从文件读取参数
 params_path = sys.argv[1]
 with open(params_path, 'r', encoding='utf-8') as f:
     params = json.load(f)
@@ -192,7 +186,6 @@ try:
         ax.bar(labels, [abs(v) for v in values], bottom=bottoms, color=colors_list, edgecolor='white')
 
     else:
-        # 默认柱状图
         labels = [item.get(x_field, str(i)) for i, item in enumerate(data)]
         values = [float(item.get(y_field, 0)) for item in data]
         ax.bar(labels, values, color='#2563EB')
@@ -202,7 +195,6 @@ try:
     plt.tight_layout()
 
 except Exception as e:
-    # 即使绘图出错也生成一个错误提示图
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.text(0.5, 0.5, f'Chart Error: {str(e)[:100]}', ha='center', va='center', fontsize=12, color='red')
     ax.set_title(title)
@@ -222,7 +214,10 @@ def generate_chart(
     y_field: str = "value",
     series_field: str = "",
 ) -> str:
-    """生成数据可视化图表（支持26种类型）。
+    """在沙箱中生成数据可视化图表（支持26种类型）。
+
+    图表在 Docker 沙箱中安全生成，不会写入宿主机文件系统。
+    如需下载到本地，请调用 download_sandbox_file 工具。
 
     Args:
         chart_type: 图表类型。支持: bar(柱状图), horizontal_bar(横向柱状图),
@@ -242,26 +237,34 @@ def generate_chart(
         series_field: 系列/分组字段名（分组图/多线图时使用，如"supplier"）
 
     Returns:
-        图表文件路径或错误信息
+        图表沙箱路径，或错误信息
     """
     if chart_type not in CHART_TYPES:
         return f"不支持的图表类型: {chart_type}。支持: {', '.join(CHART_TYPES[:10])}... 共{len(CHART_TYPES)}种"
 
-    # 解析数据
     try:
-        #isinstance 是 Python 的内置函数，用于判断一个对象是否属于某个类型（或类型元组），返回布尔值 True 或 False。
         data_list = json.loads(data) if isinstance(data, str) else data
         if not isinstance(data_list, list) or len(data_list) == 0:
             return "错误: data 必须是非空 JSON 列表"
     except json.JSONDecodeError as e:
         return f"数据格式错误: {e}。data 必须是有效的 JSON 列表。"
 
-    # 生成输出路径
-    download_dir = Path(__file__).parent.parent.parent / "download"
-    download_dir.mkdir(exist_ok=True)
-    output_path = str(download_dir / f"chart_{chart_type}_{os.getpid()}.png")
+    sandbox = get_sandbox()
+    if sandbox is None:
+        return "错误: 沙箱不可用。请确保 Docker 沙箱容器已启动。"
 
-    # 写入参数文件（避免 shell 转义问题）
+    # 沙箱内路径
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title[:20])
+    output_name = f"chart_{chart_type}_{safe_title}_{timestamp}.png"
+    charts_dir = "/workspace/charts"
+    output_path = f"{charts_dir}/{output_name}"
+    params_filename = f"_params_{timestamp}.json"
+    script_filename = f"_chart_script_{timestamp}.py"
+    params_path = f"{charts_dir}/{params_filename}"
+    script_path = f"{charts_dir}/{script_filename}"
+
+    # 构建执行参数
     params = {
         "chart_type": chart_type,
         "data": data_list,
@@ -271,47 +274,49 @@ def generate_chart(
         "y_field": y_field,
         "series_field": series_field,
     }
-    #os.getpid() 是 Python 的 os 模块中的一个函数，用于获取当前进程的进程 ID（PID）。
-    params_path = str(download_dir / f"_params_{os.getpid()}.json")
-    script_path = str(download_dir / f"_chart_{os.getpid()}.py")
 
     try:
-        with open(params_path, 'w', encoding='utf-8') as f:
-            json.dump(params, f, ensure_ascii=False)
+        # 确保目录存在
+        sandbox.execute(f"mkdir -p {charts_dir}")
 
-        with open(script_path, 'w', encoding='utf-8') as f:
-            f.write(CHART_SCRIPT)
+        # 写入脚本和参数到沙箱
+        sandbox.write_file(params_path, json.dumps(params, ensure_ascii=False))
+        sandbox.write_file(script_path, CHART_SCRIPT)
 
-        result = subprocess.run(
-            ["python", script_path, params_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        # 安装依赖（仅首次，后续复用缓存）
+        sandbox.execute("pip install -q matplotlib numpy 2>/dev/null || true", timeout=60)
 
-        if result.returncode == 0 and os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            file_name = os.path.basename(output_path)
-            download_url = f"http://localhost:8000/api/download/{file_name}"
-            agent_logger.info(f"Chart generated: {output_path} ({file_size} bytes)")
-            return (
-                f"图表已生成: {title}\n"
-                f"类型: {chart_type}\n"
-                f"数据点: {len(data_list)}\n"
-                f"文件大小: {file_size / 1024:.1f} KB\n"
-                f"下载链接: {download_url}\n"
-                f"本地路径: {output_path}"
-            )
+        # 在沙箱内执行图表生成
+        result = sandbox.execute(f"python {script_path} {params_path}", timeout=30)
+
+        # 清理临时文件
+        sandbox.execute(f"rm -f {params_path} {script_path} 2>/dev/null || true")
+
+        # 检查输出是否成功
+        if result.exit_code == 0 and "OK:" in result.output:
+            # 验证文件存在
+            if sandbox.file_exists(output_path):
+                file_size = len(sandbox.read_file_bytes(output_path))
+                agent_logger.info(
+                    f"Chart generated in sandbox: {output_path} ({file_size} bytes)"
+                )
+                return (
+                    f"✅ 图表已生成!\n"
+                    f"标题: {title}\n"
+                    f"类型: {chart_type}\n"
+                    f"数据点: {len(data_list)}\n"
+                    f"文件大小: {file_size / 1024:.1f} KB\n"
+                    f"沙箱路径: {output_path}\n"
+                    f"\n"
+                    f"💡 如需下载到本地，请使用 download_sandbox_file 工具，"
+                    f"传入沙箱路径: {output_path}"
+                )
+            else:
+                return f"图表生成后文件未找到: {output_path}"
         else:
-            error_msg = result.stderr[:500] if result.stderr else result.stdout[:200]
+            error_msg = result.output[:500] if result.output else "未知错误"
             return f"图表生成失败: {error_msg}"
 
-    except subprocess.TimeoutExpired:
-        return "图表生成超时（30秒限制）"
     except Exception as e:
+        agent_logger.error(f"Chart generation error: {e}")
         return f"图表生成异常: {str(e)}"
-    finally:
-        # 清理临时文件
-        for tmp in [params_path, script_path]:
-            if os.path.exists(tmp):
-                os.remove(tmp)

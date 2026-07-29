@@ -30,6 +30,47 @@ SKILLS_DIR = PROJECT_ROOT / "src" / "skills"
 MEMORY_DIR = Path(__file__).parent / "memory"
 
 
+def _load_skills_prompt(skills_dir: Path) -> str:
+    """
+    手动加载所有 SKILL.md 文件内容，拼接为提示词段落。
+    解决框架内置 skills 加载器无法解析含中文/空格路径的问题。
+    """
+    if not skills_dir.exists():
+        return ""
+
+    skill_sections = []
+    for skill_md in sorted(skills_dir.rglob("SKILL.md")):
+        try:
+            content = skill_md.read_text(encoding="utf-8").strip()
+            if content:
+                # 用相对路径作为技能标识
+                rel_path = str(skill_md.relative_to(skills_dir))
+                skill_sections.append(f"### Skill: {rel_path}\n{content}")
+        except Exception as e:
+            agent_logger.warning(f"Failed to load skill {skill_md}: {e}")
+
+    # 也加载独立的 .md 技能文件（非 SKILL.md）
+    for md_file in sorted(skills_dir.rglob("*.md")):
+        if md_file.name == "SKILL.md":
+            continue  # 已处理
+        try:
+            content = md_file.read_text(encoding="utf-8").strip()
+            if content and len(content) > 20:
+                rel_path = str(md_file.relative_to(skills_dir))
+                skill_sections.append(f"### Skill: {rel_path}\n{content}")
+        except Exception:
+            pass
+
+    if not skill_sections:
+        return ""
+
+    return (
+        "\n\n---\n\n## 可用技能 (Skills)\n\n"
+        "以下技能已加载到沙箱 /skills/ 目录，可通过沙箱执行：\n\n"
+        + "\n\n".join(skill_sections)
+    )
+
+
 async def precompute_agent_context(
     user_id: str = "default_user",
     username: str = "用户",
@@ -99,6 +140,28 @@ def create_main_agent(
     try:
         sandbox_backend = DockerSandboxBackend(container_name="erp-sandbox")
         agent_logger.info("Using Docker sandbox backend (erp-sandbox)")
+
+        # ===== 沙箱初始化：安装依赖 + 创建目录 =====
+        try:
+            # 创建沙箱内工作目录
+            sandbox_backend.execute("mkdir -p /workspace/charts /workspace/output /workspace/data /skills")
+            agent_logger.info("Sandbox directories created")
+
+            # 安装运行时依赖（首次安装后后续复用 Docker 缓存）
+            pip_result = sandbox_backend.execute(
+                "pip install -q matplotlib numpy pandas 2>/dev/null || true",
+                timeout=120,
+            )
+            if pip_result.exit_code == 0:
+                agent_logger.info("Sandbox dependencies installed (matplotlib, numpy, pandas)")
+            else:
+                agent_logger.warning(f"Sandbox pip install had issues: {pip_result.output[:100]}")
+        except Exception as init_err:
+            agent_logger.warning(f"Sandbox initialization error (non-fatal): {init_err}")
+
+        # ✅ 注册沙箱到全局持有器，让所有工具能访问沙箱
+        from .backends.sandbox_holder import set_sandbox
+        set_sandbox(sandbox_backend)
     except Exception as e:
         agent_logger.warning(f"Docker sandbox unavailable ({e}), falling back to LocalShell")
         sandbox_backend = LocalShellBackend(virtual_mode=True)
@@ -163,7 +226,7 @@ def create_main_agent(
         # --- 自定义中间件（执行顺序 1→7）---
         SandboxHealthMiddleware(),                                    # 1. 沙箱健康检查
         ContextInjectionMiddleware(user_context=user_context),        # 2. 用户上下文注入
-        SkillsSyncMiddleware(skills_dir=SKILLS_DIR),                  # 3. 技能同步
+        SkillsSyncMiddleware(skills_dir=SKILLS_DIR, sandbox_backend=sandbox_backend),  # 3. 技能同步
         UserSkillsRestoreMiddleware(store=store, user_id=user_context.user_id),  # 4. 技能恢复
         ToolsSummarizationMiddleware(),                               # 5. 摘要监控
         MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 6. 偏好提取
@@ -183,6 +246,13 @@ def create_main_agent(
     if delegation_prompt:
         system_prompt += delegation_prompt
 
+    # ===== 6.5 手动加载 Skill 内容注入提示词 =====
+    # 框架内置 skills 加载器无法解析含中文/空格的路径，改为手动加载
+    skills_prompt = _load_skills_prompt(SKILLS_DIR)
+    if skills_prompt:
+        system_prompt += skills_prompt
+        agent_logger.info(f"Skills loaded into prompt from {SKILLS_DIR}")
+
     # ===== 7. 创建 Agent =====
     agent = create_deep_agent(
         model=llm,
@@ -190,7 +260,7 @@ def create_main_agent(
         system_prompt=system_prompt,
         middleware=middlewares,
         subagents=subagents if subagents else None,
-        skills=[str(SKILLS_DIR)],
+        skills=[],  # 框架内置加载器路径不兼容，已通过 system_prompt 注入
         memory=[str(MEMORY_DIR / "AGENTS.md")],
         backend=backend_factory,
         interrupt_on=INTERRUPT_ON_TOOLS,

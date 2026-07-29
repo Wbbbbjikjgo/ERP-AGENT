@@ -359,20 +359,32 @@ def _install_single_file(
 
 
 def _install_dependencies(skill_dir: Path):
-    """安装 Skill 的 Python 依赖"""
+    """安装 Skill 的 Python 依赖（优先在沙箱内安装，不回退到宿主机）"""
     req_file = skill_dir / "requirements.txt"
-    if req_file.exists():
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["pip", "install", "-r", str(req_file), "-q"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                agent_logger.info(f"Skill dependencies installed from {req_file}")
+    if not req_file.exists():
+        return
+
+    # 尝试在沙箱内安装
+    try:
+        from ..backends.sandbox_holder import get_sandbox
+        sandbox = get_sandbox()
+        if sandbox is not None:
+            # 将 requirements.txt 同步到沙箱
+            req_content = req_file.read_text(encoding="utf-8")
+            sandbox_req = f"/skills/requirements_{skill_dir.name}.txt"
+            sandbox.write_file(sandbox_req, req_content)
+            result = sandbox.execute(f"pip install -r {sandbox_req} -q", timeout=120)
+            sandbox.execute(f"rm -f {sandbox_req}")
+            if result.exit_code == 0:
+                agent_logger.info(f"Skill dependencies installed in sandbox from {req_file}")
             else:
-                agent_logger.warning(f"Dependency install failed: {result.stderr[:200]}")
-        except Exception as e:
-            agent_logger.warning(f"Dependency install error: {e}")
+                agent_logger.warning(f"Sandbox dependency install failed: {result.output[:200]}")
+            return
+    except Exception as e:
+        agent_logger.warning(f"Sandbox dependency install error: {e}")
+
+    # 沙箱不可用时，仅记录警告，不在宿主机安装
+    agent_logger.warning(
+        f"Sandbox unavailable, skipping dependency installation for {req_file}. "
+        "Dependencies will be installed when sandbox is ready."
+    )

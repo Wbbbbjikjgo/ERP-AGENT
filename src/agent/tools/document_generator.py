@@ -1,9 +1,11 @@
 """
-文档生成工具（Harness — 结构化文档输出）
+文档生成工具（Harness — 沙箱内结构化文档输出）
 支持生成 Markdown、HTML、CSV、JSON、纯文本报告。
 
-Agent 在分析完数据后，可以使用此工具将结果输出为可下载的文件，
-而不仅仅是在聊天中显示文本。
+核心设计（Harness 思想）：
+- 所有文件必须先生成在 Docker 沙箱内（/workspace/output/）
+- 用户需要下载时，通过 download_sandbox_file 工具从沙箱提取到本地
+- 沙箱不可用时回退到本地生成
 
 使用场景：
 - 采购分析报告 → Markdown
@@ -20,8 +22,12 @@ from datetime import datetime
 from langchain_core.tools import tool
 
 from ..log_utils import agent_logger
+from ..backends.sandbox_holder import get_sandbox, has_sandbox
 
-DOWNLOAD_DIR = Path(__file__).parent.parent.parent / "download"
+# 沙箱内输出目录
+SANDBOX_OUTPUT_DIR = "/workspace/output"
+# 本地回退目录
+LOCAL_DOWNLOAD_DIR = Path(__file__).parent.parent.parent / "download"
 
 
 @tool
@@ -49,8 +55,6 @@ def generate_document(
     Returns:
         文件路径和下载链接
     """
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
     # 生成文件名
     if not filename:
         safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title[:30])
@@ -78,16 +82,13 @@ def generate_document(
 
 
 def _generate_markdown(title: str, content: str, filename: str) -> str:
-    """生成 Markdown 文档"""
+    """生成 Markdown 文档（优先写入沙箱）"""
     md_content = f"# {title}\n\n"
     md_content += f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
     md_content += "---\n\n"
     md_content += content
 
-    file_path = DOWNLOAD_DIR / f"{filename}.md"
-    file_path.write_text(md_content, encoding="utf-8")
-
-    return _build_result(title, "Markdown", file_path)
+    return _write_to_sandbox_or_local(f"{filename}.md", md_content, title, "Markdown")
 
 
 def _generate_html(title: str, content: str, filename: str) -> str:
@@ -154,45 +155,31 @@ def _generate_html(title: str, content: str, filename: str) -> str:
 </body>
 </html>"""
 
-    file_path = DOWNLOAD_DIR / f"{filename}.html"
-    file_path.write_text(html, encoding="utf-8")
-
-    return _build_result(title, "HTML", file_path)
+    return _write_to_sandbox_or_local(f"{filename}.html", html, title, "HTML")
 
 
 def _generate_csv(title: str, content: str, filename: str) -> str:
-    """生成 CSV 文件"""
-    file_path = DOWNLOAD_DIR / f"{filename}.csv"
-
-    # 尝试解析 content 为表格数据
+    """生成 CSV 文件（优先写入沙箱）"""
+    # 构建 CSV 内容
+    csv_content = ""
     try:
-        # 尝试 JSON 列表格式
         data = json.loads(content) if content.strip().startswith("[") else None
         if isinstance(data, list) and len(data) > 0:
-            with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=data[0].keys())
-                writer.writeheader()
-                writer.writerows(data)
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+            csv_content = output.getvalue()
         else:
-            # 纯文本逐行写入
-            with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
-                f.write(f"# {title}\n")
-                for line in content.strip().split('\n'):
-                    f.write(line + '\n')
+            csv_content = f"# {title}\n" + content
     except (json.JSONDecodeError, AttributeError):
-        with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
-            f.write(f"# {title}\n")
-            for line in content.strip().split('\n'):
-                f.write(line + '\n')
+        csv_content = f"# {title}\n" + content
 
-    return _build_result(title, "CSV", file_path)
+    return _write_to_sandbox_or_local(f"{filename}.csv", csv_content, title, "CSV")
 
 
 def _generate_json(title: str, content: str, filename: str) -> str:
-    """生成 JSON 文件"""
-    file_path = DOWNLOAD_DIR / f"{filename}.json"
-
-    # 尝试解析为 JSON
+    """生成 JSON 文件（优先写入沙箱）"""
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -203,17 +190,13 @@ def _generate_json(title: str, content: str, filename: str) -> str:
         "generated_at": datetime.now().isoformat(),
         "data": data,
     }
+    json_content = json.dumps(wrapper, ensure_ascii=False, indent=2)
 
-    file_path.write_text(
-        json.dumps(wrapper, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    return _build_result(title, "JSON", file_path)
+    return _write_to_sandbox_or_local(f"{filename}.json", json_content, title, "JSON")
 
 
 def _generate_text(title: str, content: str, filename: str) -> str:
-    """生成纯文本文件"""
+    """生成纯文本文件（优先写入沙箱）"""
     text = f"{'=' * 60}\n"
     text += f"  {title}\n"
     text += f"{'=' * 60}\n"
@@ -221,18 +204,43 @@ def _generate_text(title: str, content: str, filename: str) -> str:
     text += f"{'=' * 60}\n\n"
     text += content
 
-    file_path = DOWNLOAD_DIR / f"{filename}.txt"
-    file_path.write_text(text, encoding="utf-8")
-
-    return _build_result(title, "纯文本", file_path)
+    return _write_to_sandbox_or_local(f"{filename}.txt", text, title, "纯文本")
 
 
-def _build_result(title: str, format_name: str, file_path: Path) -> str:
-    """构建统一的返回结果"""
+def _write_to_sandbox_or_local(filename: str, content: str, title: str, format_name: str) -> str:
+    """核心写入逻辑：优先写入沙箱，回退到本地"""
+    sandbox = get_sandbox()
+
+    if sandbox is not None:
+        try:
+            # ✅ 写入沙箱 /workspace/output/ 目录
+            sandbox_path = f"{SANDBOX_OUTPUT_DIR}/{filename}"
+            sandbox.execute(f"mkdir -p {SANDBOX_OUTPUT_DIR}")
+            sandbox.write_file(sandbox_path, content)
+            file_size = len(content.encode("utf-8"))
+
+            agent_logger.info(f"Document generated in sandbox: {sandbox_path} ({file_size} bytes)")
+            return (
+                f"✅ 文档已在沙箱中生成!\n"
+                f"标题: {title}\n"
+                f"格式: {format_name}\n"
+                f"文件大小: {file_size / 1024:.1f} KB\n"
+                f"沙箱路径: {sandbox_path}\n"
+                f"\n"
+                f"💡 如需下载到本地，请使用 download_sandbox_file 工具，"
+                f"传入沙箱路径: {sandbox_path}"
+            )
+        except Exception as e:
+            agent_logger.warning(f"Sandbox write failed ({e}), falling back to local")
+
+    # 回退：写入本地
+    LOCAL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = LOCAL_DOWNLOAD_DIR / filename
+    file_path.write_text(content, encoding="utf-8")
     file_size = file_path.stat().st_size
     download_url = f"http://localhost:8000/api/download/{file_path.name}"
 
-    agent_logger.info(f"Document generated: {file_path.name} ({file_size} bytes)")
+    agent_logger.info(f"Document generated locally: {file_path.name} ({file_size} bytes)")
     return (
         f"✅ 文档生成成功!\n"
         f"标题: {title}\n"
@@ -272,8 +280,6 @@ def generate_table_report(
 
     if not isinstance(header_list, list) or not isinstance(row_list, list):
         return "错误: headers 必须是一维数组，rows 必须是二维数组"
-
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title[:30])
