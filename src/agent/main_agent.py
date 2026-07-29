@@ -124,9 +124,11 @@ def create_main_agent(
     from .tools.web_search import web_search
     from .tools.web_fetch import web_fetch, install_skill
     from .tools.hitl_tools import request_order_info
+    from .tools.download_sandbox_file import download_sandbox_file, list_sandbox_files
 
     mcp_tools = load_mcp_tools_sync()
-    custom_tools = [generate_chart, web_search, web_fetch, install_skill, request_order_info]
+    custom_tools = [generate_chart, web_search, web_fetch, install_skill, request_order_info,
+                    download_sandbox_file, list_sandbox_files]
     all_tools = mcp_tools + custom_tools
 
     agent_logger.info(
