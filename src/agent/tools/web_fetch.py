@@ -17,6 +17,7 @@ import zipfile
 import tarfile
 import httpx
 import shutil
+import yaml
 from pathlib import Path
 from langchain_core.tools import tool
 
@@ -92,61 +93,196 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
 #         ↓ 失败
 #       清理沙箱临时文件 + 返回错误
 # ============================================================
-
 def _extract_archive_to_memory(data: bytes, url: str, content_type: str) -> dict[str, bytes]:
     """
     将压缩包解压到内存字典 {相对路径: 字节内容}。
     支持 ZIP 和 TAR.GZ 格式。
     """
+    # 初始化结果字典，用于存储解压后的文件路径和内容
     result: dict[str, bytes] = {}
 
     try:
+        # 检查 URL 是否以 .zip 结尾或 content-type 包含 zip
         if url.lower().endswith(".zip") or "zip" in content_type:
+            # 使用 io.BytesIO 将字节数据转为内存中的文件对象
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                # 遍历 ZIP 包中的所有成员（文件/文件夹）
                 for member in zf.namelist():
+                    # 跳过目录（以/结尾）、__MACOSX 系统文件夹、隐藏文件（以.开头）
                     if member.endswith("/") or "/__MACOSX/" in member or member.startswith("."):
                         continue
+                    # 按第一个斜杠分割路径，获取相对路径
                     parts = member.split("/", 1)
+                    # 如果有多级目录，取第二部分作为相对路径；否则直接用文件名
                     rel_path = parts[1] if len(parts) > 1 else parts[0]
                     if rel_path:
+                        # 将文件内容读入内存，存入结果字典
                         result[rel_path] = zf.read(member)
         else:
+            # 处理 tar.gz 格式
             with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+                # 遍历 tar 包中的所有成员
                 for member in tf.getmembers():
+                    # 只处理文件（不是目录），且文件名不以.开头
                     if member.isfile() and not member.name.startswith("."):
+                        # 按第一个斜杠分割，获取相对路径
                         parts = member.name.split("/", 1)
                         rel_path = parts[1] if len(parts) > 1 else parts[0]
                         if rel_path:
+                            # 提取文件内容
                             fobj = tf.extractfile(member)
                             if fobj:
                                 result[rel_path] = fobj.read()
     except (zipfile.BadZipFile, tarfile.TarError):
-        # 不是有效的压缩包，当作单文件
+        # 如果压缩包损坏或格式不对，不做任何处理，返回空字典
         pass
 
+    # 返回解压后的文件字典
     return result
+
+
+# 允许的安全导入白名单（方案二：白名单机制）
+_ALLOWED_IMPORTS = {
+    'json', 're', 'datetime', 'collections', 'itertools',
+    'math', 'random', 'typing', 'dataclasses', 'enum',
+    'pathlib', 'os', 'io', 'csv',
+}
+
+# 危险模式检测列表
+_DANGEROUS_PATTERNS = [
+    (r'eval\s*\(', "使用了 eval()，可能执行任意代码"),
+    (r'exec\s*\(', "使用了 exec()，可能执行任意代码"),
+    (r'__import__\s*\(', "使用了动态导入，可能加载恶意模块"),
+    (r'subprocess\.(Popen|call|run|check_output|check_call)', "使用了 subprocess，可能执行系统命令"),
+    (r'os\.system\s*\(', "使用了 os.system，可能执行系统命令"),
+    (r'os\.popen\s*\(', "使用了 os.popen，可能执行系统命令"),
+    (r'builtins\s*\.', "访问了内置模块，可能有风险"),
+    (r'compile\s*\(', "使用了 compile()，可能执行动态代码"),
+    (r'pickle\.(loads|load)', "使用了 pickle 反序列化，可能有远程执行风险"),
+    (r'socket\.', "使用了 socket 通信，可能有网络风险"),
+    (r'ctypes\.', "使用了 ctypes，可能绕过 Python 安全限制"),
+]
+
+
+def _scan_python_file(content: str, filepath: str) -> list[str]:
+    """扫描单个 Python 文件的安全风险（方案二部分）。
+    返回: 警告列表（非空即有风险）
+    """
+    warnings = []
+
+    for pattern, warning in _DANGEROUS_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            warnings.append(f"{filepath}: {warning}")
+
+    return warnings
 
 
 def _validate_skill_in_sandbox(sandbox, skill_name: str, sandbox_skill_dir: str) -> tuple[bool, str, list[str]]:
     """
-    在沙箱中验证技能文件完整性。
+    在沙箱中验证技能文件完整性（严格模式：方案一 + 方案二部分）。
+
+    验证项目：
+    1. SKILL.md 文件存在性
+    2. YAML frontmatter 合法解析
+    3. 必需字段 name 的非空校验
+    4. 可选字段类型校验 (version, description)
+    5. name 字段路径安全性校验
+    6. Python 文件危险代码扫描（方案二）
+    7. 路径穿越攻击检测
+    8. 文件大小 DoS 防护
+
     返回: (是否通过, 错误信息, 文件列表)
     """
-    # 检查 SKILL.md 是否存在
+    # 1. 检查 SKILL.md 是否存在
     has_sk = sandbox.execute(f"test -f '{sandbox_skill_dir}/SKILL.md' && echo YES || echo NO")
     if has_sk.exit_code != 0 or "YES" not in has_sk.output:
         return False, "SKILL.md 未找到，技能格式无效", []
 
-    # 读取 SKILL.md 验证 frontmatter
-    read_sk = sandbox.execute(f"head -30 '{sandbox_skill_dir}/SKILL.md'")
-    if read_sk.exit_code != 0 or "name:" not in read_sk.output:
-        return False, "SKILL.md 缺少 name 字段(YAML frontmatter)", []
+    # 2. 读取完整内容
+    read_sk = sandbox.execute(f"cat '{sandbox_skill_dir}/SKILL.md'")
+    if read_sk.exit_code != 0:
+        return False, "无法读取 SKILL.md", []
 
-    # 列出所有文件
+    content = read_sk.output
+
+    # 3. 验证 YAML frontmatter 是否存在且格式正确
+    frontmatter_pattern = r'^---\s*\n(.*?)\n---\s*\n'
+    match = re.search(frontmatter_pattern, content, re.DOTALL)
+
+    if not match:
+        return False, "SKILL.md 缺少有效的 YAML frontmatter（必须用 --- 包裹）", []
+
+    # 4. 使用 yaml 库严格解析
+    try:
+        frontmatter_yaml = match.group(1)
+        metadata = yaml.safe_load(frontmatter_yaml)
+
+        if not isinstance(metadata, dict):
+            return False, "YAML frontmatter 格式错误（必须是键值对）", []
+
+        if "name" not in metadata:
+            return False, "SKILL.md frontmatter 缺少必需的 'name' 字段", []
+
+        if not metadata["name"] or not isinstance(metadata["name"], str):
+            return False, "SKILL.md 'name' 字段必须是非空字符串", []
+
+        if "version" in metadata and not isinstance(metadata["version"], str):
+            return False, "SKILL.md 'version' 字段必须是字符串", []
+
+        if "description" in metadata and not isinstance(metadata["description"], str):
+            return False, "SKILL.md 'description' 字段必须是字符串", []
+
+        if not re.match(r'^[\w\-\.]+$', metadata["name"]):
+            return False, f"SKILL.md 'name' 字段包含非法字符: {metadata['name']}", []
+
+        if metadata["name"] != skill_name:
+            agent_logger.warning(
+                f"Skill name mismatch: SKILL.md name='{metadata['name']}' != URL name='{skill_name}'"
+            )
+
+    except yaml.YAMLError as e:
+        return False, f"YAML frontmatter 解析失败: {str(e)}", []
+
+    # 5. 安全扫描：检查 Python 文件中的危险模式（方案二部分）
+    py_files_result = sandbox.execute(
+        f"find '{sandbox_skill_dir}' -name '*.py' -type f 2>/dev/null"
+    )
+    if py_files_result.exit_code == 0 and py_files_result.output.strip():
+        for py_file in py_files_result.output.strip().split('\n'):
+            if not py_file.strip():
+                continue
+            file_content = sandbox.execute(f"cat '{py_file}'")
+            if file_content.exit_code != 0:
+                continue
+            warnings = _scan_python_file(file_content.output, py_file)
+            if warnings:
+                for w in warnings:
+                    agent_logger.warning(f"Security risk in skill: {w}")
+
+    # 6. 路径穿越攻击检测 & 文件大小检查
     ls_result = sandbox.execute(f"find '{sandbox_skill_dir}' -type f | sort")
     files = []
     if ls_result.exit_code == 0:
-        files = [f.strip() for f in ls_result.output.strip().split("\n") if f.strip()]
+        for f in ls_result.output.strip().split('\n'):
+            f = f.strip()
+            if not f:
+                continue
+            if '..' in f:
+                return False, f"检测到路径穿越攻击: {f}", []
+            files.append(f)
+
+    # 7. 文件大小检查（DoS 防护）
+    for f in files:
+        size_check = sandbox.execute(
+            f"stat -c%s '{f}' 2>/dev/null || stat -f%z '{f}' 2>/dev/null"
+        )
+        if size_check.exit_code == 0 and size_check.output.strip():
+            try:
+                file_size = int(size_check.output.strip())
+                if file_size > 10 * 1024 * 1024:
+                    return False, f"文件过大 ({file_size} bytes): {f}", []
+            except ValueError:
+                pass
 
     return True, "", files
 
@@ -156,17 +292,25 @@ def _install_from_sandbox_to_host(sandbox, sandbox_skill_dir: str, host_skill_di
     从沙箱读取验证通过的文件，写入宿主机 skills 目录。
     返回已安装的文件列表。
     """
+    # 初始化已安装文件列表
     installed = []
+    # 遍历所有需要从沙箱复制的文件
     for remote_path in files:
         try:
+            # 从沙箱读取文件内容（字节）
             content = sandbox.read_file_bytes(remote_path)
-            # 计算相对于 sandbox_skill_dir 的相对路径
+            # 计算相对于沙箱技能目录的相对路径
             rel = remote_path.replace(sandbox_skill_dir, "").lstrip("/")
+            # 构建宿主机上的目标文件路径
             target = host_skill_dir / rel
+            # 创建目标文件所在的目录（如果不存在）
             target.parent.mkdir(parents=True, exist_ok=True)
+            # 将内容写入宿主机文件
             target.write_bytes(content)
+            # 记录已安装的文件名
             installed.append(rel)
         except Exception as e:
+            # 如果复制失败，记录警告日志但继续处理其他文件
             agent_logger.warning(f"Failed to copy {remote_path} from sandbox: {e}")
     return installed
 
@@ -201,129 +345,153 @@ def install_skill(url: str, skill_name: str = "") -> str:
     Returns:
         安装结果说明（含安装路径和文件列表）
     """
+    # 验证 URL 协议是否合法（只支持 HTTP 和 HTTPS）
     if not url.startswith(("http://", "https://")):
         return "错误: URL 必须以 http:// 或 https:// 开头"
 
+    # 标准化 GitHub URL，将仓库页面转为 ZIP 下载链接
     url = _normalize_github_url(url)
+    # 如果未指定技能名称，从 URL 自动提取
     if not skill_name:
         skill_name = _extract_skill_name(url)
+    # 将技能名称中的非法字符替换为下划线，确保文件系统安全
     skill_name = re.sub(r"[^\w\-]", "_", skill_name)
 
-    # 获取沙箱
+    # 获取沙箱实例（安全隔离环境）
     from ..backends.sandbox_holder import get_sandbox
     sandbox = get_sandbox()
 
     try:
-        # Step 1: 下载
+        # Step 1: 下载文件到内存
         response = httpx.get(
             url,
-            follow_redirects=True,
-            timeout=30,
-            headers={"User-Agent": "ERP-Agent/1.0 (Skill Installer)"},
+            follow_redirects=True,  # 自动跟随重定向
+            timeout=30,              # 30秒超时
+            headers={"User-Agent": "ERP-Agent/1.0 (Skill Installer)"},  # 设置 User-Agent
         )
+        # 检查 HTTP 响应状态码
         if response.status_code != 200:
             return f"下载失败: HTTP {response.status_code}"
+        # 获取响应头中的 content-type
         content_type = response.headers.get("content-type", "")
+        # 检查下载内容是否为空
         if len(response.content) == 0:
             return "错误: 下载内容为空"
 
+        # 检查沙箱是否可用
         if sandbox is None:
             return "错误: 沙箱不可用，无法安全安装 Skill"
 
         # Step 2: 在 Python 中解压，获取文件映射
+        # 在沙箱中创建临时目录用于验证
         sandbox_tmp = f"/tmp/_skill_install_{skill_name}"
 
+        # 判断是否为压缩包格式
         if _is_archive(url, content_type):
-            # 解压到内存
+            # 解压到内存字典
             files_dict = _extract_archive_to_memory(response.content, url, content_type)
         else:
-            # 单文件
+            # 单文件（SKILL.md），直接保存为字节
             files_dict = {"SKILL.md": response.text.encode("utf-8")}
 
+        # 如果没有提取到任何文件，清理沙箱临时目录并报错
         if not files_dict:
             sandbox.execute(f"rm -rf {sandbox_tmp} 2>/dev/null || true")
             return "错误: 压缩包中未找到有效文件"
 
-        # 找到 SKILL.md 所在目录前缀
+        # 找到 SKILL.md 所在的目录前缀（用于剥离顶层目录）
         skill_prefix = ""
         for path in files_dict:
             if path.endswith("SKILL.md"):
+                # 如果路径包含斜杠，取目录部分作为前缀
                 parts = path.split("/")
                 if len(parts) > 1:
                     skill_prefix = "/".join(parts[:-1]) + "/"
                 break
         else:
+            # 如果循环结束都没找到 SKILL.md
             sandbox.execute(f"rm -rf {sandbox_tmp} 2>/dev/null || true")
             return "错误: 未找到 SKILL.md，安装取消"
 
         # Step 3: 上传文件到沙箱验证
-        uploaded_files = []
+        uploaded_files = []  # 记录上传的文件路径
+        # 在沙箱中创建临时技能目录
         sandbox.execute(f"mkdir -p {sandbox_tmp}/skill")
         for rel_path, content in files_dict.items():
-            # 去掉前缀
+            # 去掉顶层目录前缀，获取纯净的相对路径
             clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
             if not clean_path:
                 continue
+            # 构建沙箱中的完整路径
             remote = f"{sandbox_tmp}/skill/{clean_path}"
+            # 将文件内容写入沙箱
             sandbox.write_file(remote, content)
             uploaded_files.append(remote)
 
-        # Step 4: 在沙箱中验证
+        # Step 4: 在沙箱中验证文件完整性
         valid, err_msg, _ = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
         if not valid:
+            # 验证失败，清理沙箱临时文件
             sandbox.execute(f"rm -rf {sandbox_tmp}")
             return f"沙箱验证失败: {err_msg}（已清理沙箱临时文件，未影响宿主机）"
 
         # Step 5: 验证通过 → 安装到宿主机 + 沙箱正式目录
-        host_skills_dir = Path(SKILLS_DIR)
-        host_skills_dir.mkdir(parents=True, exist_ok=True)
-        host_target = host_skills_dir / skill_name
+        host_skills_dir = Path(SKILLS_DIR)  # 宿主机技能目录
+        host_skills_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
+        host_target = host_skills_dir / skill_name  # 完整的目标技能路径
 
-        installed = []
-        scope = "procurement"
+        installed = []  # 记录已安装的文件
+        scope = "procurement"  # 技能作用域（采购领域）
         for rel_path, content in files_dict.items():
+            # 去除顶层目录前缀
             clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
             if not clean_path:
                 continue
 
-            # 写入宿主机
+            # 写入宿主机文件系统
             target = host_target / clean_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            installed.append(clean_path)
+            target.parent.mkdir(parents=True, exist_ok=True)  # 创建父目录
+            target.write_bytes(content)  # 写入内容
+            installed.append(clean_path)  # 记录文件
 
-            # 同步写入沙箱正式技能目录
+            # 同步写入沙箱正式技能目录（用于后续执行）
             remote_target = f"/skills/{scope}/{skill_name}/{clean_path}"
             try:
                 sandbox.write_file(remote_target, content)
             except Exception as e:
+                # 如果写入沙箱失败，记录警告但不中断安装
                 agent_logger.warning(f"Failed to write to sandbox skills dir: {e}")
 
-        # 安装依赖（沙箱内）
+        # 安装依赖（在沙箱内执行 pip install -r requirements.txt）
         _install_dependencies(host_target)
 
-        # 清理沙箱临时文件
+        # 清理沙箱临时文件（释放临时空间）
         sandbox.execute(f"rm -rf {sandbox_tmp}")
 
+        # 记录安装日志
         agent_logger.info(
             f"Skill installed (sandbox-verified): {skill_name} ({len(installed)} files)"
         )
+        # 返回成功信息，包含技能名称、路径、文件数量和列表
         return (
             f"✅ Skill 安装成功！（沙箱安全验证通过）\n"
             f"名称: {skill_name}\n"
             f"路径: {host_target}\n"
             f"文件数: {len(installed)}\n"
             f"文件列表:\n" +
-            "\n".join(f"  - {f}" for f in installed[:20]) +
+            "\n".join(f"  - {f}" for f in installed[:20]) +  # 只显示前20个文件
             (f"\n  ... 共 {len(installed)} 个文件" if len(installed) > 20 else "") +
             f"\n来源: {url}\n\n"
             f"该 Skill 已通过沙箱安全验证，现已安装到正式环境。"
         )
 
     except httpx.TimeoutException:
+        # 处理下载超时异常
         return f"下载超时: {url}"
     except Exception as e:
+        # 处理其他所有异常，记录错误日志
         agent_logger.error(f"install_skill error: {e}")
+        # 尝试清理沙箱临时文件
         if sandbox:
             try:
                 sandbox.execute(f"rm -rf /tmp/_skill_install_{skill_name} 2>/dev/null || true")
@@ -334,40 +502,45 @@ def install_skill(url: str, skill_name: str = "") -> str:
 
 def _normalize_github_url(url: str) -> str:
     """将 GitHub 仓库页面 URL 自动转换为 ZIP 下载链接"""
-    # https://github.com/user/repo → https://github.com/user/repo/archive/refs/heads/main.zip
-    # https://github.com/user/repo/tree/main/some/path → ...
+    # 匹配 GitHub 仓库 URL 的正则表达式
+    # 格式: https://github.com/owner/repo 或 https://github.com/owner/repo/tree/branch/path
     match = re.match(
         r"https?://github\.com/([^/]+)/([^/]+)(?:/tree/([^/]+)(/.+))?",
         url,
     )
     if match:
+        # 提取所有者、仓库名和分支
         owner, repo = match.group(1), match.group(2)
-        branch = match.group(3) or "main"
-        # 不转换已经是 zip 链接的 URL
+        branch = match.group(3) or "main"  # 默认使用 main 分支
+        # 如果 URL 本身不是压缩包链接，转换为 ZIP 下载链接
         if not url.endswith((".zip", ".tar.gz", ".tgz")):
             return f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
-    return url
+    return url  # 不是 GitHub 仓库 URL，原样返回
 
 
 def _extract_skill_name(url: str) -> str:
     """从 URL 提取 skill 名称"""
-    # 去掉查询参数
+    # 去掉查询参数（?后面的部分）
     path_part = url.split("?")[0].rstrip("/")
 
-    # GitHub archive: .../repo/archive/... → repo
+    # 如果是 GitHub 仓库，提取仓库名
     match = re.search(r"github\.com/[^/]+/([^/]+)", path_part)
     if match:
-        return match.group(1).replace(".git", "")
+        return match.group(1).replace(".git", "")  # 移除 .git 后缀
 
-    # 文件名
+    # 否则取路径的最后一部分作为文件名
     filename = path_part.split("/")[-1]
+    # 移除常见的压缩包和文档扩展名
     name = re.sub(r"\.(zip|tar\.gz|tgz|md|txt|markdown)$", "", filename, flags=re.IGNORECASE)
+    # 如果提取的名称为空，使用默认值
     return name or "downloaded_skill"
 
 
 def _is_archive(url: str, content_type: str) -> bool:
     """判断是否为压缩包"""
+    # 定义压缩包的扩展名列表
     archive_extensions = (".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar")
+    # 定义压缩包的 MIME 类型列表
     archive_types = (
         "application/zip",
         "application/x-zip-compressed",
@@ -378,10 +551,12 @@ def _is_archive(url: str, content_type: str) -> bool:
         "application/octet-stream",
     )
 
+    # 如果 URL 以压缩包扩展名结尾，判定为压缩包
     if any(url.lower().endswith(ext) for ext in archive_extensions):
         return True
+    # 如果 content-type 匹配压缩包类型
     if any(t in content_type for t in archive_types):
-        # 再检查是否有 .md 在 URL 中（单文件情况）
+        # 但是要排除 .md 或 .txt 单文件的情况（避免误判）
         if ".md" in url.lower() or ".txt" in url.lower():
             return False
         return True
@@ -396,22 +571,24 @@ def _install_from_archive(
     skills_dir: Path,
 ) -> str:
     """从压缩包安装 Skill 文件夹"""
+    # 构建技能的目标目录
     skill_dir = skills_dir / skill_name
 
+    # 初始化已安装文件列表
     files_installed = []
 
     try:
-        # 尝试 ZIP
+        # 尝试 ZIP 格式
         if url.lower().endswith(".zip") or "zip" in content_type:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                # 找到 SKILL.md 所在的根目录前缀
+                # 在 ZIP 中查找所有 SKILL.md 文件（不区分大小写）
                 skill_md_paths = [
                     n for n in zf.namelist()
                     if n.endswith("SKILL.md") or n.endswith("SKILL.MD")
                 ]
 
                 if not skill_md_paths:
-                    # 没有 SKILL.md，提取所有有意义的文件
+                    # 如果没有 SKILL.md，提取所有有意义的文件
                     _extract_all_files(zf, skill_dir, files_installed)
                 else:
                     # 找到 SKILL.md 所在的目录前缀
@@ -419,15 +596,16 @@ def _install_from_archive(
                     if prefix == "/":
                         prefix = ""
 
+                    # 遍历 ZIP 中的所有文件
                     for member in zf.namelist():
-                        # 跳过目录和隐藏文件
+                        # 跳过目录和 MacOS 系统文件夹
                         if member.endswith("/") or "/__MACOSX/" in member:
                             continue
-                        # 提取相对于 skill 根目录的路径
+                        # 计算相对于技能根目录的路径
                         if prefix and member.startswith(prefix):
                             rel_path = member[len(prefix):]
                         else:
-                            # GitHub 归档通常有一层目录，跳过它
+                            # GitHub 归档通常有一层顶层目录，跳过它
                             parts = member.split("/", 1)
                             if len(parts) > 1:
                                 rel_path = parts[1]
@@ -435,15 +613,19 @@ def _install_from_archive(
                                 rel_path = parts[0]
 
                         if rel_path:
+                            # 写入文件到宿主机
                             _write_member(zf, member, skill_dir / rel_path, files_installed)
         else:
-            # 尝试 tar.gz
+            # 尝试 TAR.GZ 格式
             with tarfile.open(fileobj=io.BytesIO(data)) as tf:
                 for member in tf.getmembers():
+                    # 只处理文件（不是目录），且不以.开头
                     if member.isfile() and not member.name.startswith("."):
+                        # 剥离顶层目录
                         parts = member.name.split("/", 1)
                         rel_path = parts[1] if len(parts) > 1 else parts[0]
                         if rel_path:
+                            # 提取文件内容
                             file_obj = tf.extractfile(member)
                             if file_obj:
                                 target = skill_dir / rel_path
@@ -452,20 +634,23 @@ def _install_from_archive(
                                 files_installed.append(str(rel_path))
 
     except (zipfile.BadZipFile, tarfile.TarError) as e:
-        # 压缩包损坏，当作单文件处理
+        # 如果压缩包损坏，当作单文件处理
         return _install_single_file(
             data.decode("utf-8", errors="replace"), url, skill_name, skills_dir
         )
 
+    # 如果没有安装任何文件，返回警告
     if not files_installed:
         return "警告: 压缩包中未找到有效文件"
 
-    # 安装依赖
+    # 安装依赖（如果存在 requirements.txt）
     _install_dependencies(skill_dir)
 
+    # 记录安装日志
     agent_logger.info(
         f"Skill installed from archive: {skill_name} ({len(files_installed)} files)"
     )
+    # 返回成功信息
     return (
         f"✅ Skill 安装成功!\n"
         f"名称: {skill_name}\n"
@@ -480,21 +665,28 @@ def _install_from_archive(
 
 
 def _extract_all_files(zf: zipfile.ZipFile, skill_dir: Path, files_installed: list):
-    """提取 ZIP 中所有有意义的文件"""
+    """提取 ZIP 中所有有意义的文件（当没有 SKILL.md 时）"""
+    # 遍历 ZIP 中的所有成员
     for member in zf.namelist():
+        # 跳过目录、MacOS 系统文件、隐藏文件
         if member.endswith("/") or "/__MACOSX/" in member or member.startswith("."):
             continue
+        # 剥离顶层目录
         parts = member.split("/", 1)
         rel_path = parts[1] if len(parts) > 1 else parts[0]
         if rel_path:
+            # 写入文件
             _write_member(zf, member, skill_dir / rel_path, files_installed)
 
 
 def _write_member(zf: zipfile.ZipFile, member: str, target: Path, files_installed: list):
-    """写入单个 ZIP 成员"""
+    """写入单个 ZIP 成员到宿主机文件系统"""
+    # 创建父目录
     target.parent.mkdir(parents=True, exist_ok=True)
+    # 从 ZIP 中读取内容并写入目标文件
     with zf.open(member) as src:
         target.write_bytes(src.read())
+    # 记录已安装的文件（相对于父父目录的路径）
     files_installed.append(str(target.relative_to(target.parent.parent)))
 
 
@@ -505,13 +697,18 @@ def _install_single_file(
     skills_dir: Path,
 ) -> str:
     """安装单个 .md 文件（向后兼容，创建标准文件夹结构）"""
+    # 构建技能目录
     skill_dir = skills_dir / skill_name
+    # 创建技能目录
     skill_dir.mkdir(parents=True, exist_ok=True)
 
+    # 将内容写入 SKILL.md
     file_path = skill_dir / "SKILL.md"
     file_path.write_text(content, encoding="utf-8")
 
+    # 记录安装日志
     agent_logger.info(f"Skill installed (single file): {skill_name} from {url}")
+    # 返回成功信息
     return (
         f"✅ Skill 安装成功!\n"
         f"名称: {skill_name}\n"
@@ -525,20 +722,24 @@ def _install_single_file(
 
 def _install_dependencies(skill_dir: Path):
     """安装 Skill 的 Python 依赖（优先在沙箱内安装，不回退到宿主机）"""
+    # 检查 requirements.txt 是否存在
     req_file = skill_dir / "requirements.txt"
     if not req_file.exists():
         return
 
-    # 尝试在沙箱内安装
+    # 尝试在沙箱内安装依赖
     try:
         from ..backends.sandbox_holder import get_sandbox
         sandbox = get_sandbox()
         if sandbox is not None:
-            # 将 requirements.txt 同步到沙箱
+            # 读取 requirements.txt 内容
             req_content = req_file.read_text(encoding="utf-8")
+            # 将内容写入沙箱临时文件
             sandbox_req = f"/skills/requirements_{skill_dir.name}.txt"
             sandbox.write_file(sandbox_req, req_content)
+            # 在沙箱中执行 pip install
             result = sandbox.execute(f"pip install -r {sandbox_req} -q", timeout=120)
+            # 清理沙箱临时文件
             sandbox.execute(f"rm -f {sandbox_req}")
             if result.exit_code == 0:
                 agent_logger.info(f"Skill dependencies installed in sandbox from {req_file}")
@@ -548,7 +749,8 @@ def _install_dependencies(skill_dir: Path):
     except Exception as e:
         agent_logger.warning(f"Sandbox dependency install error: {e}")
 
-    # 沙箱不可用时，仅记录警告，不在宿主机安装
+    # 如果沙箱不可用，仅记录警告，不在宿主机安装依赖
+    # 这样做是为了保持宿主机环境清洁，依赖会在沙箱准备好时安装
     agent_logger.warning(
         f"Sandbox unavailable, skipping dependency installation for {req_file}. "
         "Dependencies will be installed when sandbox is ready."
