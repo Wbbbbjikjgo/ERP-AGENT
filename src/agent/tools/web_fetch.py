@@ -414,52 +414,35 @@ def install_skill(url: str, skill_name: str = "") -> str:
             return "错误: 未找到 SKILL.md，安装取消"
 
         # Step 3: 上传文件到沙箱验证
-        uploaded_files = []  # 记录上传的文件路径
-        # 在沙箱中创建临时技能目录
         sandbox.execute(f"mkdir -p {sandbox_tmp}/skill")
         for rel_path, content in files_dict.items():
-            # 去掉顶层目录前缀，获取纯净的相对路径
             clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
             if not clean_path:
                 continue
-            # 构建沙箱中的完整路径
-            remote = f"{sandbox_tmp}/skill/{clean_path}"
-            # 将文件内容写入沙箱
-            sandbox.write_file(remote, content)
-            uploaded_files.append(remote)
+            sandbox.write_file(f"{sandbox_tmp}/skill/{clean_path}", content)
 
         # Step 4: 在沙箱中验证文件完整性
-        valid, err_msg, _ = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
+        valid, err_msg, sandbox_files = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
         if not valid:
             # 验证失败，清理沙箱临时文件
             sandbox.execute(f"rm -rf {sandbox_tmp}")
             return f"沙箱验证失败: {err_msg}（已清理沙箱临时文件，未影响宿主机）"
 
-        # Step 5: 验证通过 → 安装到宿主机 + 沙箱正式目录
-        host_skills_dir = Path(SKILLS_DIR)  # 宿主机技能目录
-        host_skills_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
-        host_target = host_skills_dir / skill_name  # 完整的目标技能路径
+        # Step 5: 验证通过 → 从沙箱复制到宿主机 + 沙箱正式目录
+        sandbox_verify_dir = f"{sandbox_tmp}/skill"
+        host_skills_dir = Path(SKILLS_DIR)
+        host_skills_dir.mkdir(parents=True, exist_ok=True)
+        host_target = host_skills_dir / skill_name
 
-        installed = []  # 记录已安装的文件
-        scope = "procurement"  # 技能作用域（采购领域）
-        for rel_path, content in files_dict.items():
-            # 去除顶层目录前缀
-            clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
-            if not clean_path:
-                continue
+        installed = _install_from_sandbox_to_host(sandbox, sandbox_verify_dir, host_target, sandbox_files)
 
-            # 写入宿主机文件系统
-            target = host_target / clean_path
-            target.parent.mkdir(parents=True, exist_ok=True)  # 创建父目录
-            target.write_bytes(content)  # 写入内容
-            installed.append(clean_path)  # 记录文件
-
-            # 同步写入沙箱正式技能目录（用于后续执行）
-            remote_target = f"/skills/{scope}/{skill_name}/{clean_path}"
+        # 同步写入沙箱正式技能目录（用于后续执行）
+        scope = "procurement"
+        for rel in installed:
+            remote_target = f"/skills/{scope}/{skill_name}/{rel}"
             try:
-                sandbox.write_file(remote_target, content)
+                sandbox.write_file(remote_target, sandbox.read_file_bytes(f"{sandbox_verify_dir}/{rel}"))
             except Exception as e:
-                # 如果写入沙箱失败，记录警告但不中断安装
                 agent_logger.warning(f"Failed to write to sandbox skills dir: {e}")
 
         # 安装依赖（在沙箱内执行 pip install -r requirements.txt）
