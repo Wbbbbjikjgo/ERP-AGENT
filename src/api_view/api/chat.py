@@ -79,6 +79,7 @@ async def stream_chat_response(
     phase = "thinking"  # 当前阶段: thinking → planning → executing → reviewing → result
     last_phase = "thinking"  # 上次已发射的阶段（去重）
     last_todos_sig = None  # 上次已发射的 todo 列表签名（去重）
+    harness_trace: list = []  # Harness 阶段流转 trace（P3 可观测）
 
     try:
         # 发射“深度思考”事件（前端展示思考动画）
@@ -98,9 +99,16 @@ async def stream_chat_response(
                     if new_phase and new_phase != last_phase:
                         last_phase = new_phase
                         phase = new_phase
+                        label = PHASE_LABELS.get(new_phase, new_phase)
+                        harness_trace.append({
+                            "type": "phase",
+                            "phase": new_phase,
+                            "label": label,
+                            "timestamp": datetime.now().isoformat(),
+                        })
                         yield sse_event("phase", {
                             "phase": new_phase,
-                            "label": PHASE_LABELS.get(new_phase, new_phase),
+                            "label": label,
                         })
 
                     # --- 结构化 todo 列表（来自 TodoListMiddleware 的 write_todos 状态）---
@@ -166,6 +174,7 @@ async def stream_chat_response(
                                 "timestamp": datetime.now().isoformat(),
                             })
                         await agent_loader.save_display_messages(thread_id, display_messages)
+                        await agent_loader.save_harness_trace(thread_id, harness_trace)
                         yield sse_event("done", {"thread_id": thread_id, "interrupted": True})
                         return
                 continue
@@ -182,12 +191,18 @@ async def stream_chat_response(
                             yield sse_event("phase", {"phase": "reviewing", "label": "🔍 审查中"})
                     elif ev_type == "rubric_evaluation_end":
                         # 评审器产出结构化判定 → 发射 review_result 事件
-                        yield sse_event("review_result", {
+                        review_data = {
                             "verdict": chunk.get("result", ""),
                             "explanation": chunk.get("explanation", ""),
                             "criteria": chunk.get("criteria", []),
                             "iteration": chunk.get("iteration", 0),
+                        }
+                        harness_trace.append({
+                            "type": "review",
+                            **review_data,
+                            "timestamp": datetime.now().isoformat(),
                         })
+                        yield sse_event("review_result", review_data)
                 continue
 
             # ===== Messages 流处理 =====
@@ -298,6 +313,7 @@ async def stream_chat_response(
             })
 
         await agent_loader.save_display_messages(thread_id, display_messages)
+        await agent_loader.save_harness_trace(thread_id, harness_trace)
 
         # 自动生成会话标题（首条消息前20字）
         if message:

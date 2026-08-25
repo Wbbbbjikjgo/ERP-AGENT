@@ -117,6 +117,20 @@ class AgentLoader:
         db = get_db()
         await db.conversations.delete_one({"thread_id": thread_id})
         await db.display_messages.delete_one({"thread_id": thread_id})
+        await db.harness_traces.delete_one({"thread_id": thread_id})
+
+    async def save_harness_trace(self, thread_id: str, trace: list):
+        """保存 Harness 阶段流转 trace 到 MongoDB（可观测/审计）
+
+        记录 Planning → Executing → Review → Result 各阶段的流转时间线，
+        以及评审器的结构化判定结果，支持事后审计"哪一步卡住了"。
+        """
+        db = get_db()
+        await db.harness_traces.update_one(
+            {"thread_id": thread_id},
+            {"$set": {"trace": trace, "updated_at": datetime.now().isoformat()}},
+            upsert=True,
+        )
 
 
 # 全局单例
