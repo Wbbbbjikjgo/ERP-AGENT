@@ -26,7 +26,7 @@ from typing_extensions import NotRequired, TypedDict
 from langchain.agents.middleware import AgentMiddleware, Runtime
 from langchain.agents.middleware.types import AgentState
 
-from .schema import Phase
+from .schema import Phase, ReviewResult
 from .log_utils import agent_logger
 
 # DSL 配置文件路径
@@ -160,6 +160,46 @@ class HarnessPhaseMiddleware(AgentMiddleware):
 
         return updates
 
+    def after_model(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
+        """模型返回工具调用 → 进入执行阶段（executing）。
+
+        这是"阶段作为图状态"的关键一环：executing 不再是 chat.py 里
+        对文本的猜测，而是模型产出工具调用时由中间件结构性地写入 state。
+        """
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+        last = messages[-1]
+        if getattr(last, "tool_calls", None):
+            return {"phase": Phase.executing.value}
+        return None
+
     def after_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """执行后：置终态阶段为 result。"""
-        return {"phase": Phase.result.value}
+        """执行后：根据评审状态置终态阶段 + 构建结构化评审结果。
+
+        说明：after_agent 钩子按逆序执行，RubricMiddleware（注册在本中间件之后）
+        会先完成 grading 并更新 _rubric_status，故此处可读取其私有状态。
+        """
+        updates: dict[str, Any] = {}
+
+        # 从 RubricMiddleware 的私有状态构建结构化评审结果（持久化到 checkpoint）
+        status = state.get("_rubric_status")
+        if status:
+            evaluations = state.get("_rubric_evaluations") or []
+            last = evaluations[-1] if evaluations else {}
+            review_result = ReviewResult(
+                verdict=status,
+                explanation=last.get("explanation", ""),
+                criteria=[dict(c) for c in last.get("criteria", [])],
+                iteration=last.get("iteration", 0),
+            )
+            updates["review_result"] = review_result.model_dump()
+
+        # 阶段流转：needs_revision 表示评审未通过、将打回重做 → reviewing；
+        # 其余（satisfied/failed/超限/异常/无 rubric）均为终态 → result
+        if status == "needs_revision":
+            updates["phase"] = Phase.reviewing.value
+        else:
+            updates["phase"] = Phase.result.value
+
+        return updates

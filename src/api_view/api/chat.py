@@ -9,7 +9,6 @@
 - SSE 事件协议: token / tool_start / tool_args / tool_result / tool_end / interrupt / done
 """
 import json
-import re
 import uuid
 from typing import AsyncGenerator
 from datetime import datetime
@@ -28,6 +27,16 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 def sse_event(event: str, data: dict) -> str:
     """格式化 SSE 事件（严格遵循 event:/data: 协议）"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# Harness 阶段 → 前端展示文案
+PHASE_LABELS = {
+    "planning": "📝 规划中",
+    "executing": "⚙️ 执行中",
+    "reviewing": "🔍 审查中",
+    "result": "📊 已完成",
+    "thinking": "💭 思考中",
+}
 
 
 async def stream_chat_response(
@@ -67,8 +76,9 @@ async def stream_chat_response(
     assistant_content = ""
     tool_calls_buffer = []
     thinking_emitted = False
-    planning_emitted = False  # 是否已发射过规划事件
-    phase = "thinking"  # 当前阶段: thinking → planning → executing → reviewing → done
+    phase = "thinking"  # 当前阶段: thinking → planning → executing → reviewing → result
+    last_phase = "thinking"  # 上次已发射的阶段（去重）
+    last_todos_sig = None  # 上次已发射的 todo 列表签名（去重）
 
     try:
         # 发射“深度思考”事件（前端展示思考动画）
@@ -77,55 +87,107 @@ async def stream_chat_response(
         async for namespace, chunk_type, chunk in agent_loader.agent.astream(
             input=current_input,
             config=config,
-            stream_mode=["messages", "values"],
+            stream_mode=["messages", "values", "custom"],
             subgraphs=True,
         ):
-            # ===== 中断检测（必须在 messages 处理之前）=====
+            # ===== 中断检测 + 结构化 Harness 状态读取（必须在 messages 处理之前）=====
             if chunk_type == "values":
-                if isinstance(chunk, dict) and chunk.get("interrupts"):
-                    for interrupt_item in chunk["interrupts"]:
-                        interrupt_value = (
-                            interrupt_item.value
-                            if hasattr(interrupt_item, "value")
-                            else interrupt_item
-                        )
-                        if isinstance(interrupt_value, dict):
-                            # 判断中断类型
-                            if interrupt_value.get("type") == "order_info_request":
-                                yield sse_event("interrupt", {
-                                    "interrupt_type": "order_info_supplement",
-                                    "missing_fields": interrupt_value.get("missing_fields", []),
-                                    "message": interrupt_value.get("message", ""),
-                                    "extracted_data": interrupt_value.get("current_data", {}),
-                                })
-                            elif "action_requests" in interrupt_value:
-                                yield sse_event("interrupt", {
-                                    "interrupt_type": "hitl_approval",
-                                    "tool_name": interrupt_value.get("tool_name", ""),
-                                    "tool_args": interrupt_value.get("action_requests", {}),
-                                    "order_data": interrupt_value.get("action_requests", {}),
-                                })
-                            else:
-                                # 通用中断（interrupt_on 触发的审批）
-                                yield sse_event("interrupt", {
-                                    "interrupt_type": "hitl_approval",
-                                    "tool_name": interrupt_value.get("tool_name", ""),
-                                    "tool_args": interrupt_value.get("tool_args", interrupt_value),
-                                    "order_data": interrupt_value.get("tool_args", interrupt_value),
+                if isinstance(chunk, dict):
+                    # --- 结构化阶段流转（来自 HarnessPhaseMiddleware 写入的 state.phase）---
+                    new_phase = chunk.get("phase")
+                    if new_phase and new_phase != last_phase:
+                        last_phase = new_phase
+                        phase = new_phase
+                        yield sse_event("phase", {
+                            "phase": new_phase,
+                            "label": PHASE_LABELS.get(new_phase, new_phase),
+                        })
+
+                    # --- 结构化 todo 列表（来自 TodoListMiddleware 的 write_todos 状态）---
+                    todos = chunk.get("todos")
+                    if todos is not None:
+                        todos_sig = json.dumps(todos, ensure_ascii=False, sort_keys=True)
+                        if todos_sig != last_todos_sig:
+                            last_todos_sig = todos_sig
+                            plan_items = [
+                                {
+                                    "id": f"todo-{i}",
+                                    "content": t.get("content", ""),
+                                    "status": t.get("status", "pending"),
+                                }
+                                for i, t in enumerate(todos)
+                            ]
+                            if plan_items:
+                                yield sse_event("todo_update", {
+                                    "phase": "planning",
+                                    "todos": plan_items,
                                 })
 
-                    # 保存当前累积的消息
-                    if assistant_content:
-                        display_messages.append({
-                            "id": str(uuid.uuid4()),
-                            "role": "assistant",
-                            "content": assistant_content,
-                            "toolCalls": tool_calls_buffer,
-                            "timestamp": datetime.now().isoformat(),
+                    # --- 中断检测 ---
+                    if chunk.get("interrupts"):
+                        for interrupt_item in chunk["interrupts"]:
+                            interrupt_value = (
+                                interrupt_item.value
+                                if hasattr(interrupt_item, "value")
+                                else interrupt_item
+                            )
+                            if isinstance(interrupt_value, dict):
+                                # 判断中断类型
+                                if interrupt_value.get("type") == "order_info_request":
+                                    yield sse_event("interrupt", {
+                                        "interrupt_type": "order_info_supplement",
+                                        "missing_fields": interrupt_value.get("missing_fields", []),
+                                        "message": interrupt_value.get("message", ""),
+                                        "extracted_data": interrupt_value.get("current_data", {}),
+                                    })
+                                elif "action_requests" in interrupt_value:
+                                    yield sse_event("interrupt", {
+                                        "interrupt_type": "hitl_approval",
+                                        "tool_name": interrupt_value.get("tool_name", ""),
+                                        "tool_args": interrupt_value.get("action_requests", {}),
+                                        "order_data": interrupt_value.get("action_requests", {}),
+                                    })
+                                else:
+                                    # 通用中断（interrupt_on 触发的审批）
+                                    yield sse_event("interrupt", {
+                                        "interrupt_type": "hitl_approval",
+                                        "tool_name": interrupt_value.get("tool_name", ""),
+                                        "tool_args": interrupt_value.get("tool_args", interrupt_value),
+                                        "order_data": interrupt_value.get("tool_args", interrupt_value),
+                                    })
+
+                        # 保存当前累积的消息
+                        if assistant_content:
+                            display_messages.append({
+                                "id": str(uuid.uuid4()),
+                                "role": "assistant",
+                                "content": assistant_content,
+                                "toolCalls": tool_calls_buffer,
+                                "timestamp": datetime.now().isoformat(),
+                            })
+                        await agent_loader.save_display_messages(thread_id, display_messages)
+                        yield sse_event("done", {"thread_id": thread_id, "interrupted": True})
+                        return
+                continue
+
+            # ===== Custom 流处理（评审器等中间件的结构化事件）=====
+            if chunk_type == "custom":
+                if isinstance(chunk, dict):
+                    ev_type = chunk.get("type", "")
+                    if ev_type == "rubric_evaluation_start":
+                        # 评审器开始 grading → 进入审查阶段
+                        if phase != "reviewing":
+                            phase = "reviewing"
+                            last_phase = "reviewing"
+                            yield sse_event("phase", {"phase": "reviewing", "label": "🔍 审查中"})
+                    elif ev_type == "rubric_evaluation_end":
+                        # 评审器产出结构化判定 → 发射 review_result 事件
+                        yield sse_event("review_result", {
+                            "verdict": chunk.get("result", ""),
+                            "explanation": chunk.get("explanation", ""),
+                            "criteria": chunk.get("criteria", []),
+                            "iteration": chunk.get("iteration", 0),
                         })
-                    await agent_loader.save_display_messages(thread_id, display_messages)
-                    yield sse_event("done", {"thread_id": thread_id, "interrupted": True})
-                    return
                 continue
 
             # ===== Messages 流处理 =====
@@ -149,13 +211,6 @@ async def stream_chat_response(
                     if not thinking_emitted:
                         yield sse_event("thinking", {"status": "end"})
                         thinking_emitted = True
-                    # 进入执行阶段
-                    if phase in ("thinking", "planning"):
-                        phase = "executing"
-                        yield sse_event("phase", {"phase": "executing", "label": "⚙️ 执行中"})
-                        # 更新 todo 状态为 executing
-                        if planning_emitted:
-                            yield sse_event("todo_update", {"phase": "executing", "status_change": "executing"})
                     for tc in tool_call_chunks:
                         if isinstance(tc, dict):
                             if tc.get("name"):
@@ -221,31 +276,6 @@ async def stream_chat_response(
                         yield sse_event("thinking", {"status": "end"})
                         thinking_emitted = True
                     assistant_content += content
-
-                    # === Harness 阶段检测 ===
-                    # 检测 Planning 阶段（必须有明确的规划标题头 + 编号步骤）
-                    if not planning_emitted and len(assistant_content) > 80:
-                        # 严格匹配：必须含“任务规划”“执行计划”“Planning”等明确标题
-                        has_plan_header = bool(re.search(r'(任务规划|执行计划|操作步骤|Planning|Plan)', assistant_content))
-                        if has_plan_header:
-                            # 提取编号列表项（排除纯能力描述）
-                            plan_items = re.findall(r'[\d]+[.、)\]]\s*(?:\[[ x]?\]\s*)?(.+?)(?:\n|$)', assistant_content)
-                            # 过滤太短的项（可能是列表装饰）
-                            plan_items = [item for item in plan_items if len(item.strip()) > 4]
-                            if len(plan_items) >= 2:
-                                planning_emitted = True
-                                phase = "planning"
-                                todos = [{"id": f"plan-{i}", "content": item.strip(), "status": "pending"} for i, item in enumerate(plan_items)]
-                                yield sse_event("todo_update", {
-                                    "phase": "planning",
-                                    "todos": todos,
-                                })
-                                yield sse_event("phase", {"phase": "planning", "label": "📝 规划中"})
-
-                    # 检测 Review 阶段
-                    if phase == "executing" and any(marker in content for marker in ["Review", "审查", "🔍", "验证结果", "总结"]):
-                        phase = "reviewing"
-                        yield sse_event("phase", {"phase": "reviewing", "label": "🔍 审查中"})
 
                     # 判断来源（通过 namespace 元组）
                     source = "main"
