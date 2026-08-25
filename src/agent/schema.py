@@ -3,9 +3,10 @@
 ProcurementContext、UserPreferences、ChatRequest 等 Pydantic 模型
 定义整个项目中流转的数据结构。这是类型安全的保障——所有请求、响应、上下文都通过这些模型约束。
 """
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
 
 
 class UserPreferences(BaseModel):
@@ -62,3 +63,48 @@ class DisplayMessage(BaseModel):
     tool_calls: Optional[List[dict]] = Field(default=None, description="工具调用信息")
     source: Optional[str] = Field(default=None, description="来源: main/analyst/order")
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+
+# ============================================================
+# Harness 架构结构化状态模型（Planning → Executing → Review → Result）
+# 用于替代 prompt 软约束：阶段、计划、评审结果都是可校验的强类型数据
+# ============================================================
+
+class Phase(str, Enum):
+    """Harness 工作流阶段（图状态机，非文本猜测）"""
+    thinking = "thinking"      # 思考中（初始态）
+    planning = "planning"      # Planning：生成任务规划
+    executing = "executing"    # Executing：调用工具/子Agent执行
+    reviewing = "reviewing"    # Review：评审器校验结果
+    result = "result"          # Result：结构化输出最终结果
+
+
+class PlanStep(BaseModel):
+    """规划中的单个步骤（对应 TodoListMiddleware 的 todo 项，但增加 result 回填）"""
+    id: str = Field(..., description="步骤唯一标识")
+    content: str = Field(..., description="步骤描述")
+    status: Literal["pending", "in_progress", "completed"] = Field(
+        default="pending", description="步骤状态"
+    )
+    result: Optional[str] = Field(default=None, description="步骤执行结果摘要")
+
+
+class Plan(BaseModel):
+    """Harness Planning 阶段的产物：结构化任务规划"""
+    steps: List[PlanStep] = Field(default_factory=list, description="规划步骤列表")
+    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    current_step: Optional[str] = Field(default=None, description="当前执行中的步骤 id")
+
+
+class ReviewResult(BaseModel):
+    """Harness Review 阶段的产物：评审器对执行结果的判定
+
+    由 RubricMiddleware 的 grader 子Agent 产出，结构化而非 LLM 自述文本。
+    """
+    verdict: Literal[
+        "satisfied", "needs_revision", "failed",
+        "max_iterations_reached", "grader_error",
+    ] = Field(..., description="评审判定")
+    explanation: str = Field(default="", description="评审结论说明")
+    criteria: List[dict] = Field(default_factory=list, description="逐条评审标准判定")
+    iteration: int = Field(default=0, description="评审迭代次数")
