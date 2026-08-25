@@ -9,7 +9,7 @@ import fnmatch
 from typing import Optional
 from pathlib import Path
 
-from deepagents import create_deep_agent
+from deepagents import create_deep_agent, RubricMiddleware
 from deepagents.backends import CompositeBackend, StoreBackend, LocalShellBackend
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
@@ -300,6 +300,13 @@ def create_main_agent(
     from .middlewares.tools_summarization import ToolsSummarizationMiddleware
     from .middlewares.memory_update import MemoryUpdateMiddleware
     from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
+    # Harness 阶段状态机 + 评审器（真 Harness 架构核心）
+    from .harness import HarnessPhaseMiddleware, load_harness_config
+
+    # 读取 Harness DSL 配置中的评审迭代上限
+    _harness_config = load_harness_config()
+    _review_cfg = _harness_config.get("review", {}) if isinstance(_harness_config, dict) else {}
+    _review_max_iterations = _review_cfg.get("max_iterations", 3)
 
     # 注意：create_deep_agent 内部已自动添加：
     # - SummarizationMiddleware（自动摘要 + compact_conversation 工具）
@@ -309,12 +316,17 @@ def create_main_agent(
     middlewares = [
         # --- 自定义中间件（执行顺序 1→7）---
         SandboxHealthMiddleware(),                                    # 1. 沙箱健康检查
-        ContextInjectionMiddleware(user_context=user_context),        # 2. 用户上下文注入
-        SkillsSyncMiddleware(skills_dir=SKILLS_DIR, sandbox_backend=sandbox_backend),  # 3. 技能同步
-        UserSkillsRestoreMiddleware(store=store, user_id=user_context.user_id),  # 4. 技能恢复
-        ToolsSummarizationMiddleware(),                               # 5. 摘要监控
-        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 6. 偏好提取
-        SandboxCircuitBreakerMiddleware(failure_threshold=3, recovery_timeout=60),  # 7. 熔断器
+        HarnessPhaseMiddleware(),                                     # 2. 阶段状态机 + rubric 注入
+        ContextInjectionMiddleware(user_context=user_context),        # 3. 用户上下文注入
+        SkillsSyncMiddleware(skills_dir=SKILLS_DIR, sandbox_backend=sandbox_backend),  # 4. 技能同步
+        UserSkillsRestoreMiddleware(store=store, user_id=user_context.user_id),  # 5. 技能恢复
+        ToolsSummarizationMiddleware(),                               # 6. 摘要监控
+        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 7. 偏好提取
+        SandboxCircuitBreakerMiddleware(failure_threshold=3, recovery_timeout=60),  # 8. 熔断器
+        # --- Harness 评审器（RubricMiddleware）---
+        # 收到 rubric 后，grader 子Agent 结构化产出 satisfied/needs_revision/failed，
+        # needs_revision 时自动打回模型重做，形成真实 Review 回路（非 prompt 软约束）
+        RubricMiddleware(model=llm, max_iterations=_review_max_iterations),
         # --- 框架内置中间件（调用限制）---
         ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),          # 模型调用上限
         ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),            # 工具调用上限
