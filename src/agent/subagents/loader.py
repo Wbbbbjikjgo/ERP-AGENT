@@ -35,6 +35,77 @@ def _validate_subagent_config(config: dict) -> bool:
     return all(field in config and config[field] for field in REQUIRED_FIELDS)
 
 
+def _get_output_format(config: dict) -> dict | None:
+    """提取子Agent的输出契约定义（支持顶层 output_format 或 context_protocol.output_format）"""
+    output_format = config.get("output_format")
+    if isinstance(output_format, dict):
+        return output_format
+    protocol = config.get("context_protocol")
+    if isinstance(protocol, dict):
+        nested = protocol.get("output_format")
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _validate_output_format(config: dict) -> bool:
+    """校验子Agent的 output_format 契约结构（声明式输出契约的强校验）
+
+    校验规则：
+    - output_format 必须为 dict
+    - 若含 sections 字段，必须是字符串列表
+
+    Args:
+        config: 子Agent配置字典
+
+    Returns:
+        True 表示结构合法（或未声明 output_format，向后兼容），False 表示非法
+    """
+    output_format = _get_output_format(config)
+    if output_format is None:
+        return True  # 未声明输出契约，不强制
+    sections = output_format.get("sections")
+    if sections is not None and (
+        not isinstance(sections, list)
+        or not all(isinstance(s, str) for s in sections)
+    ):
+        agent_logger.error(
+            f"Invalid output_format.sections in {config.get('name')}: must be a list of strings"
+        )
+        return False
+    return True
+
+
+def build_output_contract_prompt(config: dict) -> str:
+    """根据 output_format 生成输出契约提示词（注入子Agent system_prompt）。
+
+    使 YAML 中声明的输出结构成为子Agent必须遵守的显式契约，
+    并由主Agent的 RubricMiddleware 依据评审标准对子Agent输出做校验。
+    """
+    output_format = _get_output_format(config)
+    if output_format is None:
+        return ""
+
+    fmt_type = output_format.get("type", "structured_report")
+    sections = output_format.get("sections", [])
+    fmt = output_format.get("format", "markdown")
+
+    if not sections:
+        return ""
+
+    lines = [
+        "\n\n## 输出契约（必须严格遵守）",
+        f"你的最终返回结果必须符合以下结构化契约（类型：{fmt_type}，格式：{fmt}）：",
+    ]
+    for i, section in enumerate(sections, 1):
+        lines.append(f"{i}. **{section}**")
+
+    lines.append(
+        "主Agent 将依据此契约对你的输出进行校验；缺失任一 section 将被视为不合格并触发返工。"
+    )
+    return "\n".join(lines)
+
+
 def _parse_interrupt_on(config: dict) -> dict | None:
     """解析 YAML 中的 interrupt_on 配置为框架格式
     
@@ -149,13 +220,18 @@ def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> li
         
         # 解析 interrupt_on 配置
         interrupt_on = _parse_interrupt_on(config)
-        
+
+        # 校验 output_format 契约结构（非法则记录错误，仍继续创建但契约不注入）
+        output_contract = ""
+        if _validate_output_format(config):
+            output_contract = build_output_contract_prompt(config)
+
         # 构建子Agent规格字典
         subagent_spec = {
-            "name": config["name"],  # 子Agent名称
-            "description": config["description"],  # 子Agent描述
-            "system_prompt": config["system_prompt"],  # 系统提示词
-            "tools": matched_tools,  # 匹配到的实际工具对象
+            "name": config["name"],
+            "description": config["description"],
+            "system_prompt": config["system_prompt"] + output_contract,
+            "tools": matched_tools,
         }
         
         # 如果有 interrupt_on 配置，添加到规格中
