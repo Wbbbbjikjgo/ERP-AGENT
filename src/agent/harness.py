@@ -26,7 +26,7 @@ from typing_extensions import NotRequired, TypedDict
 from langchain.agents.middleware import AgentMiddleware, Runtime
 from langchain.agents.middleware.types import AgentState
 
-from .schema import Phase, ReviewResult
+from .schema import Phase, ReviewResult, Plan, PlanStep
 from .log_utils import agent_logger
 
 # DSL 配置文件路径
@@ -122,6 +122,33 @@ def build_rubric(task_type: str, config: dict[str, Any]) -> str:
     return rubric.strip()
 
 
+def _build_plan_from_todos(todos: list | None) -> dict | None:
+    """将 TodoListMiddleware 的 todos 转换为结构化 Plan（让 Plan/PlanStep 模型真正生效）。
+
+    todos 格式（框架产出）: [{content: str, status: "pending"|"in_progress"|"completed"}]
+    Plan 格式（Harness 结构化）: {steps: [{id, content, status, result}], created_at, current_step}
+
+    Returns:
+        Plan.model_dump() 或 None（todos 为空时）
+    """
+    if not todos:
+        return None
+
+    steps: list[PlanStep] = []
+    current_step: str | None = None
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            continue
+        content = t.get("content", "")
+        status = t.get("status", "pending")
+        step_id = f"step-{i}"
+        steps.append(PlanStep(id=step_id, content=content, status=status))
+        if status == "in_progress" and current_step is None:
+            current_step = step_id
+
+    return Plan(steps=steps, current_step=current_step).model_dump()
+
+
 class HarnessPhaseMiddleware(AgentMiddleware):
     """Harness 阶段状态机中间件。
 
@@ -161,18 +188,25 @@ class HarnessPhaseMiddleware(AgentMiddleware):
         return updates
 
     def after_model(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """模型返回工具调用 → 进入执行阶段（executing）。
+        """模型返回后：跟踪阶段 + 同步结构化 plan。
 
-        这是"阶段作为图状态"的关键一环：executing 不再是 chat.py 里
-        对文本的猜测，而是模型产出工具调用时由中间件结构性地写入 state。
+        - 模型产出工具调用 → 置 phase=executing（结构性写入，非正则猜测）
+        - 将 TodoListMiddleware 的 todos 同步为结构化 Plan 写入 plan 字段
         """
+        updates: dict[str, Any] = {}
+
         messages = state.get("messages", [])
-        if not messages:
-            return None
-        last = messages[-1]
-        if getattr(last, "tool_calls", None):
-            return {"phase": Phase.executing.value}
-        return None
+        if messages and getattr(messages[-1], "tool_calls", None):
+            updates["phase"] = Phase.executing.value
+
+        # 同步 todos → plan（让 plan 字段真正生效）
+        todos = state.get("todos")
+        if todos:
+            plan = _build_plan_from_todos(todos)
+            if plan:
+                updates["plan"] = plan
+
+        return updates or None
 
     def after_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
         """执行后：根据评审状态置终态阶段 + 构建结构化评审结果。
@@ -194,6 +228,13 @@ class HarnessPhaseMiddleware(AgentMiddleware):
                 iteration=last.get("iteration", 0),
             )
             updates["review_result"] = review_result.model_dump()
+
+        # 最终同步 plan（含评审后的最终步骤状态）
+        todos = state.get("todos")
+        if todos:
+            plan = _build_plan_from_todos(todos)
+            if plan:
+                updates["plan"] = plan
 
         # 阶段流转：needs_revision 表示评审未通过、将打回重做 → reviewing；
         # 其余（satisfied/failed/超限/异常/无 rubric）均为终态 → result
