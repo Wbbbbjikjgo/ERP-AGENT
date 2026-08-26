@@ -2341,7 +2341,7 @@ DockerSandboxBackend = CustomOpenSandbox
         """
         if self._container is None:
             return ExecuteResponse(output="[沙箱未连接]", exit_code=-1)
-    
+        
         try:
             exec_result = self._container.exec_run(
                 cmd=["bash", "-c", f"cd {self._work_dir} && {command}"],
@@ -2958,14 +2958,43 @@ Harness 编排模块（真 Harness 架构核心）
 3. build_rubric / detect_task_type — 按任务类型生成评审标准
 4. HarnessPhaseMiddleware — 阶段状态机 + rubric 注入
 """
+
+# ============================================================
+# 导入依赖
+# ============================================================
+
+# typing_extensions: 类型提示扩展库，支持 NotRequired（可选字段）
 from typing_extensions import NotRequired, TypedDict
+
+# AgentMiddleware: LangChain 的中间件基类，用于在 Agent 执行前后插入逻辑
+# Runtime: 运行时上下文，包含配置和工具等信息
 from langchain.agents.middleware import AgentMiddleware, Runtime
+
+# AgentState: LangChain 定义的 Agent 状态基类
 from langchain.agents.middleware.types import AgentState
+
+# Phase: 枚举类型，定义工作流的4个阶段（planning/executing/reviewing/result）
+# ReviewResult: 评审结果的数据结构（verdict/explanation/criteria/iteration）
 from .schema import Phase, ReviewResult
+
+# agent_logger: 日志记录器，用于输出调试/运行日志
 from .log_utils import agent_logger
 
+# Path: 路径处理库，用于定位配置文件
+from pathlib import Path
+
+
+# ============================================================
+# 配置文件路径
+# ============================================================
+
+# 定义 Harness 配置文件的路径（与当前文件同目录下的 harness_config.yaml）
 HARNESS_CONFIG_PATH = Path(__file__).parent / "harness_config.yaml"
 
+
+# ============================================================
+# 扩展状态定义
+# ============================================================
 
 class HarnessPhaseState(AgentState):
     """Harness 扩展状态：在 DeepAgentState 基础上增加阶段/计划/评审字段。
@@ -2973,105 +3002,239 @@ class HarnessPhaseState(AgentState):
     通过 HarnessPhaseMiddleware.state_schema 声明，由框架自动合并进 graph state，
     因此这些字段会出现在 checkpoint 和 values 流中（可观测、可恢复）。
     """
-    phase: NotRequired[str]      # 当前阶段：planning/executing/reviewing/result
-    plan: NotRequired[dict]      # 结构化任务规划
-    review_result: NotRequired[dict]  # 评审结果
+    
+    # phase: 当前工作流阶段，可选值为 planning/executing/reviewing/result
+    # NotRequired 表示这个字段不是必须的，可以不传
+    phase: NotRequired[str]
+    
+    # plan: 结构化任务规划，包含任务分解、步骤等
+    # dict 类型，可以存储任意键值对
+    plan: NotRequired[dict]
+    
+    # review_result: 评审结果，包含 verdict（通过/需修改）、explanation（解释）等
+    review_result: NotRequired[dict]
 
+
+# ============================================================
+# 加载配置文件
+# ============================================================
 
 def load_harness_config(config_path=None) -> dict:
     """加载 Harness DSL 配置，缺失时回退到 _DEFAULT_CONFIG"""
-    ...
+    # 函数体略（实际会读取 YAML 文件并解析为 dict）
+    # 如果文件不存在或读取失败，返回默认配置
+    pass
 
+
+# ============================================================
+# 识别任务类型
+# ============================================================
 
 def detect_task_type(messages, config) -> str:
     """根据用户消息关键词识别任务类型（analysis/order/inventory/supplier/default）"""
-    ...
+    # messages: 对话历史，包含用户和 AI 的消息
+    # config: 加载的配置字典，包含 task_types 关键词映射
+    # 返回: 匹配的任务类型字符串，如果没有匹配则返回 "default"
+    pass
 
+
+# ============================================================
+# 构建评审标准
+# ============================================================
 
 def build_rubric(task_type, config) -> str:
     """按任务类型生成评审标准字符串（交给 RubricMiddleware 打分）"""
-    ...
+    # task_type: 任务类型，如 "analysis"、"order" 等
+    # config: 配置字典，包含 rubrics 评审标准定义
+    # 返回: 对应任务类型的评审标准文本
+    pass
 
+
+# ============================================================
+# 阶段状态机中间件（核心）
+# ============================================================
 
 class HarnessPhaseMiddleware(AgentMiddleware):
-    """Harness 阶段状态机中间件。"""
+    """Harness 阶段状态机中间件。
+    
+    这个中间件在 Agent 执行的不同生命周期钩子中插入逻辑，
+    控制工作流在4个阶段之间流转。
+    """
+    
+    # 声明这个中间件扩展的状态结构
+    # 框架会自动把 HarnessPhaseState 的字段合并到全局状态中
     state_schema = HarnessPhaseState
 
+    # ============================================================
+    # before_agent: Agent 执行前调用
+    # ============================================================
+    
     def before_agent(self, state, runtime):
         """识别任务类型 → 注入 rubric（激活评审器）→ 置 phase=planning"""
-        updates = {"phase": Phase.planning.value}
+        
+        # 准备状态更新字典
+        updates = {"phase": Phase.planning.value}  # 将阶段设为 "planning"
+        
+        # 检查状态中是否已有 rubric（评审标准）
         if not state.get("rubric"):
+            # 从消息中识别任务类型
             task_type = detect_task_type(state.get("messages", []), self._config)
+            
+            # 根据任务类型构建评审标准
             rubric = build_rubric(task_type, self._config)
+            
+            # 如果成功构建了评审标准，加入更新
             if rubric:
                 updates["rubric"] = rubric
+        
+        # 返回更新，框架会自动合并到状态中
         return updates
 
+    # ============================================================
+    # after_model: 模型调用后调用
+    # ============================================================
+    
     def after_model(self, state, runtime):
         """模型返回工具调用 → 置 phase=executing（结构性写入，非正则猜测）"""
+        
+        # 获取当前对话消息
         messages = state.get("messages", [])
+        
+        # 检查最后一条消息是否包含工具调用（tool_calls）
+        # 如果包含，说明 Agent 正在执行工具，进入执行阶段
         if messages and getattr(messages[-1], "tool_calls", None):
+            # 将阶段切换为 "executing"
             return {"phase": Phase.executing.value}
+        
+        # 没有工具调用，不更新状态
         return None
 
+    # ============================================================
+    # after_agent: Agent 完整执行后调用
+    # ============================================================
+    
     def after_agent(self, state, runtime):
         """根据评审状态置终态 + 构建结构化 review_result 持久化到 checkpoint"""
+        
+        # 获取评审状态（由 RubricMiddleware 设置）
+        # _rubric_status 可能的值: "passed"（通过）或 "needs_revision"（需修改）
         status = state.get("_rubric_status")
+        
+        # 准备状态更新字典
         updates = {}
+        
+        # 如果有评审状态，构建结构化的评审结果
         if status:
+            # 获取所有评审评估记录（列表）
             evaluations = state.get("_rubric_evaluations") or []
+            
+            # 取最后一次评估结果
             last = evaluations[-1] if evaluations else {}
+            
+            # 构建 ReviewResult 对象并转为字典
             updates["review_result"] = ReviewResult(
-                verdict=status,
-                explanation=last.get("explanation", ""),
-                criteria=[dict(c) for c in last.get("criteria", [])],
-                iteration=last.get("iteration", 0),
-            ).model_dump()
+                verdict=status,  # 评审结论: "passed" 或 "needs_revision"
+                explanation=last.get("explanation", ""),  # 评审解释
+                criteria=[dict(c) for c in last.get("criteria", [])],  # 详细标准打分
+                iteration=last.get("iteration", 0),  # 当前是第几次评审
+            ).model_dump()  # 转为字典以便序列化存储
+        
+        # 根据评审状态决定最终阶段
+        # 如果需要修改 → 进入 reviewing 阶段（可能触发重新执行）
+        # 如果通过 → 进入 result 阶段（任务完成）
         updates["phase"] = (
             Phase.reviewing.value if status == "needs_revision"
             else Phase.result.value
         )
+        
+        # 返回更新
         return updates
 ```
 
 **配套 DSL 配置** `harness_config.yaml`（声明式，改流程不改代码）：
 
 ```yaml
-phases:
-  - name: planning
-    label: "📝 规划中"
-  - name: executing
-    label: "⚙️ 执行中"
-  - name: reviewing
-    label: "🔍 审查中"
-  - name: result
-    label: "📊 已完成"
+# ============================================================
+# Harness 工作流声明式配置（DSL）
+# 将 Planning → Executing → Review → Result 四阶段与评审标准
+# 从 prompts.py 中抽离，实现"改流程不改代码"。
+# ============================================================
 
+# ═══════════════════════════════════════════════════════════════
+# 阶段定义（顺序即流转顺序，label 用于前端展示）
+# ═══════════════════════════════════════════════════════════════
+phases:                           # 工作流程的4个阶段
+  - name: planning                # 阶段1：规划阶段
+    label: "📝 规划中"            # 前端显示的友好名称
+  - name: executing               # 阶段2：执行阶段
+    label: "⚙️ 执行中"            # 前端显示"执行中"
+  - name: reviewing               # 阶段3：审查阶段
+    label: "🔍 审查中"            # 检查执行结果是否符合要求
+  - name: result                  # 阶段4：结果阶段
+    label: "📊 已完成"            # 任务完成，输出最终结果
+
+# ═══════════════════════════════════════════════════════════════
+# 评审器配置（由 RubricMiddleware 消费）
+# ═══════════════════════════════════════════════════════════════
 review:
-  max_iterations: 3          # 单次 rubric 最多评审迭代次数
-  model: null                # 使用主 LLM
+  max_iterations: 3               # 最多评审3次，如果一直不合格就停止
+  model: null                     # 使用默认AI模型；可指定如"gpt-4"
 
-task_types:                  # 任务类型识别关键词（自动选择 rubric）
-  analysis: {keywords: [分析, 对比, 统计, 趋势, 报表, 图表, 报告, 评估]}
-  order:    {keywords: [下单, 采购, 订单, 新增, 修改, 审批, 创建]}
-  inventory:{keywords: [库存, 入库, 出库, 盘点, 预警]}
-  supplier: {keywords: [供应商, 供货, 信用]}
+# ═══════════════════════════════════════════════════════════════
+# 任务类型识别关键词（用于自动选择评审标准）
+# ═══════════════════════════════════════════════════════════════
+task_types:                       # 根据用户问题中的关键词自动判断任务类型
+  analysis:                       # 分析类任务
+    keywords: [分析, 对比, 统计, 趋势, 报表, 图表, 报告, 评估]
+  order:                          # 订单类任务
+    keywords: [下单, 采购, 订单, 新增, 修改, 审批, 创建]
+  inventory:                      # 库存类任务
+    keywords: [库存, 入库, 出库, 盘点, 预警]
+  supplier:                       # 供应商类任务
+    keywords: [供应商, 供货, 信用]
 
-rubrics:                     # 各任务类型评审标准（"什么算完成"）
-  analysis: |
-    1. 使用 MCP 工具获取了真实业务数据
-    2. 输出了包含数据表格的结构化分析报告
-    3. 生成了可视化图表
-    4. 分析结论有明确的数据支撑
-  order: |
-    1. 提取了完整的订单字段
-    2. 数据校验通过：quantity >= 1，unitPrice > 0
-    3. 创建/修改前展示了完整订单摘要
-    4. 写操作已触发人工审批中断
-  # ... default / inventory / supplier
+# ═══════════════════════════════════════════════════════════════
+# 各任务类型的评审标准（"什么算完成"）
+# ═══════════════════════════════════════════════════════════════
+rubrics:                          # 评分标准（检查表）
+  default: |                      # 默认标准（所有任务都适用）
+    1. 完整回答用户的问题，未遗漏关键信息
+    2. 所有数据均来自真实工具调用，未编造数据
+    3. 输出使用 Markdown 格式，列表数据使用表格
+    4. 金额保留两位小数，日期格式为 yyyy-MM-dd
+    5. 结论有数据支撑，并给出可执行的建议
 
+  analysis: |                     # 分析任务的专用标准
+    1. 使用 MCP 工具获取了真实业务数据（供应商/零部件/库存/订单）
+    2. 对数据进行了清洗、汇总，提取出关键指标
+    3. 输出了包含数据表格的结构化分析报告
+    4. 生成了可视化图表（图表类型与数据类型匹配）
+    5. 分析结论有明确的数据支撑，采购建议可执行
+
+  order: |                        # 订单任务的专用标准
+    1. 提取了完整的订单字段（orderNumber、orderDetail、数量、单价）
+    2. 缺失字段时通过 request_order_info 向用户询问，未擅自假设
+    3. 数据校验通过：quantity >= 1，unitPrice > 0，partId 有效
+    4. 创建/修改前向用户展示了完整订单摘要
+    5. 写操作已触发人工审批中断，未绕过审批
+
+  inventory: |                    # 库存任务的专用标准
+    1. 使用库存工具获取了真实库存数据
+    2. 准确识别了低于安全库存的预警项
+    3. 入库/出库操作的数据（partId、数量）完整且合法
+    4. 输出包含库存状态总结与补货建议
+
+  supplier: |                     # 供应商任务的专用标准
+    1. 使用供应商工具获取了真实供应商数据
+    2. 准确展示了信用评级、合作状态、供货能力
+    3. 对比分析有明确的数据维度
+    4. 给出了供应商选择或合作建议
+
+# ═══════════════════════════════════════════════════════════════
+# 可观测性配置（监控和调试）
+# ═══════════════════════════════════════════════════════════════
 observability:
-  trace_phase_transitions: true
+  trace_phase_transitions: true   # 是否记录每个阶段切换的日志
 ```
 
 **设计决策**：
@@ -4026,7 +4189,7 @@ MAIN_SYSTEM_PROMPT = """你是"智能采购助手"，基于 Harness Engineering 
 3. 创建/修改订单前必须获得用户确认
 4. 默认 Markdown 格式，金额保留2位小数
 """
-  ```
+```
 
 **设计要点**：
 - `{user_id}` / `{username}` / `{preferences}` 是模板变量，在 `main_agent.py` 中通过 `.format()` 填充
