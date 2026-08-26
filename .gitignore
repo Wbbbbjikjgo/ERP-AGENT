@@ -1,0 +1,42 @@
+# ============ 环境变量（含 API Key，严禁提交） ============
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# ============ Node.js / Next.js ============
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# ============ 生成文件 / 下载目录 ============
+src/download/
+
+# ============ 日志 ============
+*.log
+
+# ============ IDE / 系统 ============
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
