@@ -39,7 +39,9 @@ src/
 ├── agent/                             # Agent 层 — DeepAgent 核心
 │   ├── main_agent.py                  # 主入口：create_main_agent() 7步组装
 │   ├── config.py                      # 全局配置
-│   ├── schema.py                      # Pydantic 数据模型
+│   ├── schema.py                      # Pydantic 数据模型（含 Harness 结构化状态）
+│   ├── harness.py                     # ★Harness 编排（阶段状态机 + rubric 注入）
+│   ├── harness_config.yaml            # ★Harness DSL 配置（四阶段/评审标准）
 │   ├── env_utils.py                   # 环境变量加载
 │   ├── log_utils.py                   # 日志工具
 │   ├── middleware_config.py           # 子Agent中间件工厂（完整中间件栈）
@@ -48,7 +50,7 @@ src/
 │   │   ├── prompts.py                 # 系统提示词
 │   │   └── AGENTS.md                  # 全局操作手册
 │   ├── subagents/
-│   │   ├── loader.py                  # YAML加载+工具解析
+│   │   ├── loader.py                  # YAML加载+工具解析+输出契约校验
 │   │   └── configs/
 │   │       ├── procurement_analyst.yaml  # 分析专家配置
 │   │       └── procurement_order.yaml    # 订单专家配置
@@ -142,14 +144,14 @@ src/
 
 1. **前端** → POST `/api/chat/stream` (SSE)
 2. **chat.py** → `agent_loader.initialize()` 确保 Agent 已创建
-3. **chat.py** → `agent.astream(input, stream_mode=["messages","values"])` 开始流式执行
-4. **main_agent.py** → 中间件栈依次执行 `before_agent()`
-5. **LLM** 输出 Planning 文本 → chat.py 检测到编号列表 → 发射 `todo_update` + `phase` SSE 事件
+3. **chat.py** → `agent.astream(input, stream_mode=["messages","values","custom"])` 开始流式执行
+4. **main_agent.py** → 中间件栈依次执行 `before_agent()`（含 `HarnessPhaseMiddleware` 注入 rubric）
+5. **LLM** 调用 `write_todos` → `TodoListMiddleware` 写入 `state.todos` → chat.py 从 values 流读取 → 发射 `todo_update` + `phase=planning`
 6. **LLM** 决定委派给 `procurement-analyst` 子Agent
 7. **子Agent** 调用 MCP 工具 → `mcp_client.py` → SSE 连接 MCP Server → `suppliers_tools.py` → HTTP 请求 Java ERP
-8. **子Agent** 调用 `generate_chart` → 本地 matplotlib 生成 PNG
-9. **LLM** 输出 Review + Result → chat.py 检测阶段变化 → 发射 `phase` 事件
-10. **chat.py** → 流结束 → 保存 display_messages 到 MongoDB → 发射 `done` 事件
+8. **子Agent** 调用 `generate_chart` → 沙箱内 matplotlib 生成 PNG
+9. **RubricMiddleware** grader 子Agent 对照 rubric 打分 → 发射 `review_result`，needs_revision 时打回重做
+10. **chat.py** → 流结束 → 保存 display_messages + harness_trace 到 MongoDB → 发射 `done` 事件
 
 ---
 
@@ -279,18 +281,19 @@ middleware_logger = get_logger("middleware")  # 中间件
 
 ---
 
-### 2.3 `src/agent/schema.py` — Pydantic 数据模型（63行）
+### 2.3 `src/agent/schema.py` — Pydantic 数据模型（含 Harness 结构化状态）
 
-**作用**：定义整个项目中流转的数据结构。这是类型安全的保障——所有请求、响应、上下文都通过这些模型约束。
+**作用**：定义整个项目中流转的数据结构。这是类型安全的保障——所有请求、响应、上下文都通过这些模型约束。**本次改造新增了 Harness 四阶段的结构化状态模型**（Phase/PlanStep/Plan/ReviewResult），替代原先靠 prompt 软约束 + 正则猜测的脆弱实现。
 
 ```python
 """
 数据模型定义
 ProcurementContext、UserPreferences、ChatRequest 等 Pydantic 模型
 """
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
 
 
 class UserPreferences(BaseModel):
@@ -335,7 +338,7 @@ class ResumeRequest(BaseModel):
 
 class SSEEvent(BaseModel):
     """SSE 事件模型"""
-    event: str = Field(..., description="事件类型: token/tool_start/tool_result/interrupt/done")
+    event: str = Field(..., description="事件类型: token/tool_start/tool_args/tool_result/tool_end/interrupt/done")
     data: dict = Field(default_factory=dict, description="事件数据")
 
 
@@ -359,9 +362,56 @@ class DisplayMessage(BaseModel):
     tool_calls: Optional[List[dict]] = Field(default=None, description="工具调用信息")
     source: Optional[str] = Field(default=None, description="来源: main/analyst/order")
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+
+# ============================================================
+# Harness 架构结构化状态模型（Planning → Executing → Review → Result）
+# 用于替代 prompt 软约束：阶段、计划、评审结果都是可校验的强类型数据
+# ============================================================
+
+class Phase(str, Enum):
+    """Harness 工作流阶段（图状态机，非文本猜测）"""
+    thinking = "thinking"      # 思考中（初始态）
+    planning = "planning"      # Planning：生成任务规划
+    executing = "executing"    # Executing：调用工具/子Agent执行
+    reviewing = "reviewing"    # Review：评审器校验结果
+    result = "result"          # Result：结构化输出最终结果
+
+
+class PlanStep(BaseModel):
+    """规划中的单个步骤（对应 TodoListMiddleware 的 todo 项，但增加 result 回填）"""
+    id: str = Field(..., description="步骤唯一标识")
+    content: str = Field(..., description="步骤描述")
+    status: Literal["pending", "in_progress", "completed"] = Field(
+        default="pending", description="步骤状态"
+    )
+    result: Optional[str] = Field(default=None, description="步骤执行结果摘要")
+
+
+class Plan(BaseModel):
+    """Harness Planning 阶段的产物：结构化任务规划"""
+    steps: List[PlanStep] = Field(default_factory=list, description="规划步骤列表")
+    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    current_step: Optional[str] = Field(default=None, description="当前执行中的步骤 id")
+
+
+class ReviewResult(BaseModel):
+    """Harness Review 阶段的产物：评审器对执行结果的判定
+
+    由 RubricMiddleware 的 grader 子Agent 产出，结构化而非 LLM 自述文本。
+    """
+    verdict: Literal[
+        "satisfied", "needs_revision", "failed",
+        "max_iterations_reached", "grader_error",
+    ] = Field(..., description="评审判定")
+    explanation: str = Field(default="", description="评审结论说明")
+    criteria: List[dict] = Field(default_factory=list, description="逐条评审标准判定")
+    iteration: int = Field(default=0, description="评审迭代次数")
 ```
 
-**被谁依赖**：`chat.py`（ChatRequest/ResumeRequest）、`main_agent.py`（ProcurementContext）、`agent_loader.py`（ConversationRecord/DisplayMessage）、`context_injection.py`（ProcurementContext）。
+**被谁依赖**：
+- 基础模型：`chat.py`（ChatRequest/ResumeRequest）、`main_agent.py`（ProcurementContext）、`agent_loader.py`（ConversationRecord/DisplayMessage）、`context_injection.py`（ProcurementContext）。
+- Harness 模型：`harness.py`（Phase/ReviewResult）、`chat.py`（阶段/评审结构化事件）。
 
 ---
 
@@ -1447,30 +1497,55 @@ def _extract_archive_to_memory(data: bytes, url: str, content_type: str) -> dict
 
 def _validate_skill_in_sandbox(sandbox, skill_name: str, sandbox_skill_dir: str) -> tuple[bool, str, list[str]]:
     """
-    在沙箱中验证技能文件完整性。
-    返回: (是否通过, 错误信息, 文件列表)
+    在沙箱中验证技能文件完整性（严格模式：方案一 YAML 严格解析 + 方案二危险代码扫描）。
+
+    验证项目：
+    1. SKILL.md 文件存在性
+    2. YAML frontmatter 合法解析（yaml.safe_load）
+    3. 必需字段 name 的非空校验
+    4. 可选字段类型校验（version, description）
+    5. name 字段路径安全性校验（[\\w\\-\\.]+）
+    6. Python 文件危险代码扫描（eval/exec/subprocess/pickle 等 11 种模式）
+    7. 路径穿越攻击检测（..）
+    8. 文件大小 DoS 防护（10MB 上限）
     """
-    # 检查 SKILL.md 文件是否存在
-    # 在沙箱中执行 shell 命令，如果文件存在输出 YES，否则输出 NO
+    # 1. 检查 SKILL.md 是否存在
     has_sk = sandbox.execute(f"test -f '{sandbox_skill_dir}/SKILL.md' && echo YES || echo NO")
-    # 如果命令执行失败或输出不包含 YES，说明 SKILL.md 不存在
     if has_sk.exit_code != 0 or "YES" not in has_sk.output:
         return False, "SKILL.md 未找到，技能格式无效", []
 
-    # 读取 SKILL.md 的前 30 行，用于验证 YAML frontmatter
-    read_sk = sandbox.execute(f"head -30 '{sandbox_skill_dir}/SKILL.md'")
-    # 如果命令执行失败或内容中不包含 "name:" 字段，说明缺少必需的元数据
-    if read_sk.exit_code != 0 or "name:" not in read_sk.output:
-        return False, "SKILL.md 缺少 name 字段(YAML frontmatter)", []
+    # 2. 读取完整内容 + 3. 校验 YAML frontmatter
+    read_sk = sandbox.execute(f"cat '{sandbox_skill_dir}/SKILL.md'")
+    content = read_sk.output
+    frontmatter_pattern = r'^---\s*\n(.*?)\n---\s*\n'
+    match = re.search(frontmatter_pattern, content, re.DOTALL)
+    if not match:
+        return False, "SKILL.md 缺少有效的 YAML frontmatter（必须用 --- 包裹）", []
 
-    # 列出技能目录下的所有文件（用于后续安装）
+    # 4. 使用 yaml 库严格解析 + 字段校验
+    metadata = yaml.safe_load(match.group(1))
+    if not isinstance(metadata, dict):
+        return False, "YAML frontmatter 格式错误（必须是键值对）", []
+    if "name" not in metadata or not metadata["name"] or not isinstance(metadata["name"], str):
+        return False, "SKILL.md 'name' 字段必须是非空字符串", []
+    if not re.match(r'^[\w\-\.]+$', metadata["name"]):
+        return False, f"SKILL.md 'name' 字段包含非法字符: {metadata['name']}", []
+
+    # 5. 安全扫描：检查 .py 文件中的危险模式（方案二部分）
+    py_files = sandbox.execute(f"find '{sandbox_skill_dir}' -name '*.py' -type f")
+    for py_file in py_files.output.strip().split('\n'):
+        content = sandbox.execute(f"cat '{py_file}'").output
+        for pattern, warning in _DANGEROUS_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                agent_logger.warning(f"Security risk in {py_file}: {warning}")
+
+    # 6. 路径穿越检测 + 7. 文件大小检查
     ls_result = sandbox.execute(f"find '{sandbox_skill_dir}' -type f | sort")
-    files = []
-    if ls_result.exit_code == 0:
-        # 将输出按换行分割，去除空白行，存入列表
-        files = [f.strip() for f in ls_result.output.strip().split("\n") if f.strip()]
+    files = [f.strip() for f in ls_result.output.strip().split("\n") if f.strip()]
+    for f in files:
+        if '..' in f:
+            return False, f"检测到路径穿越攻击: {f}", []
 
-    # 验证通过，返回成功标志、空错误信息和文件列表
     return True, "", files
 
 
@@ -1601,52 +1676,35 @@ def install_skill(url: str, skill_name: str = "") -> str:
             return "错误: 未找到 SKILL.md，安装取消"
 
         # Step 3: 上传文件到沙箱验证
-        uploaded_files = []  # 记录上传的文件路径
-        # 在沙箱中创建临时技能目录
         sandbox.execute(f"mkdir -p {sandbox_tmp}/skill")
         for rel_path, content in files_dict.items():
-            # 去掉顶层目录前缀，获取纯净的相对路径
             clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
             if not clean_path:
                 continue
-            # 构建沙箱中的完整路径
-            remote = f"{sandbox_tmp}/skill/{clean_path}"
-            # 将文件内容写入沙箱
-            sandbox.write_file(remote, content)
-            uploaded_files.append(remote)
+            sandbox.write_file(f"{sandbox_tmp}/skill/{clean_path}", content)
 
         # Step 4: 在沙箱中验证文件完整性
-        valid, err_msg, _ = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
+        valid, err_msg, sandbox_files = _validate_skill_in_sandbox(sandbox, skill_name, f"{sandbox_tmp}/skill")
         if not valid:
             # 验证失败，清理沙箱临时文件
             sandbox.execute(f"rm -rf {sandbox_tmp}")
             return f"沙箱验证失败: {err_msg}（已清理沙箱临时文件，未影响宿主机）"
 
-        # Step 5: 验证通过 → 安装到宿主机 + 沙箱正式目录
-        host_skills_dir = Path(SKILLS_DIR)  # 宿主机技能目录
-        host_skills_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
-        host_target = host_skills_dir / skill_name  # 完整的目标技能路径
+        # Step 5: 验证通过 → 从沙箱复制到宿主机 + 沙箱正式目录
+        sandbox_verify_dir = f"{sandbox_tmp}/skill"
+        host_skills_dir = Path(SKILLS_DIR)
+        host_skills_dir.mkdir(parents=True, exist_ok=True)
+        host_target = host_skills_dir / skill_name
 
-        installed = []  # 记录已安装的文件
-        scope = "procurement"  # 技能作用域（采购领域）
-        for rel_path, content in files_dict.items():
-            # 去除顶层目录前缀
-            clean_path = rel_path[len(skill_prefix):] if rel_path.startswith(skill_prefix) else rel_path
-            if not clean_path:
-                continue
+        installed = _install_from_sandbox_to_host(sandbox, sandbox_verify_dir, host_target, sandbox_files)
 
-            # 写入宿主机文件系统
-            target = host_target / clean_path
-            target.parent.mkdir(parents=True, exist_ok=True)  # 创建父目录
-            target.write_bytes(content)  # 写入内容
-            installed.append(clean_path)  # 记录文件
-
-            # 同步写入沙箱正式技能目录（用于后续执行）
-            remote_target = f"/skills/{scope}/{skill_name}/{clean_path}"
+        # 同步写入沙箱正式技能目录（用于后续执行）
+        scope = "procurement"
+        for rel in installed:
+            remote_target = f"/skills/{scope}/{skill_name}/{rel}"
             try:
-                sandbox.write_file(remote_target, content)
+                sandbox.write_file(remote_target, sandbox.read_file_bytes(f"{sandbox_verify_dir}/{rel}"))
             except Exception as e:
-                # 如果写入沙箱失败，记录警告但不中断安装
                 agent_logger.warning(f"Failed to write to sandbox skills dir: {e}")
 
         # 安装依赖（在沙箱内执行 pip install -r requirements.txt）
@@ -1750,161 +1808,9 @@ def _is_archive(url: str, content_type: str) -> bool:
     return False
 
 
-def _install_from_archive(
-    data: bytes,
-    url: str,
-    content_type: str,
-    skill_name: str,
-    skills_dir: Path,
-) -> str:
-    """从压缩包安装 Skill 文件夹"""
-    # 构建技能的目标目录
-    skill_dir = skills_dir / skill_name
-
-    # 初始化已安装文件列表
-    files_installed = []
-
-    try:
-        # 尝试 ZIP 格式
-        if url.lower().endswith(".zip") or "zip" in content_type:
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                # 在 ZIP 中查找所有 SKILL.md 文件（不区分大小写）
-                skill_md_paths = [
-                    n for n in zf.namelist()
-                    if n.endswith("SKILL.md") or n.endswith("SKILL.MD")
-                ]
-
-                if not skill_md_paths:
-                    # 如果没有 SKILL.md，提取所有有意义的文件
-                    _extract_all_files(zf, skill_dir, files_installed)
-                else:
-                    # 找到 SKILL.md 所在的目录前缀
-                    prefix = "/".join(skill_md_paths[0].split("/")[:-1]) + "/"
-                    if prefix == "/":
-                        prefix = ""
-
-                    # 遍历 ZIP 中的所有文件
-                    for member in zf.namelist():
-                        # 跳过目录和 MacOS 系统文件夹
-                        if member.endswith("/") or "/__MACOSX/" in member:
-                            continue
-                        # 计算相对于技能根目录的路径
-                        if prefix and member.startswith(prefix):
-                            rel_path = member[len(prefix):]
-                        else:
-                            # GitHub 归档通常有一层顶层目录，跳过它
-                            parts = member.split("/", 1)
-                            if len(parts) > 1:
-                                rel_path = parts[1]
-                            else:
-                                rel_path = parts[0]
-
-                        if rel_path:
-                            # 写入文件到宿主机
-                            _write_member(zf, member, skill_dir / rel_path, files_installed)
-        else:
-            # 尝试 TAR.GZ 格式
-            with tarfile.open(fileobj=io.BytesIO(data)) as tf:
-                for member in tf.getmembers():
-                    # 只处理文件（不是目录），且不以.开头
-                    if member.isfile() and not member.name.startswith("."):
-                        # 剥离顶层目录
-                        parts = member.name.split("/", 1)
-                        rel_path = parts[1] if len(parts) > 1 else parts[0]
-                        if rel_path:
-                            # 提取文件内容
-                            file_obj = tf.extractfile(member)
-                            if file_obj:
-                                target = skill_dir / rel_path
-                                target.parent.mkdir(parents=True, exist_ok=True)
-                                target.write_bytes(file_obj.read())
-                                files_installed.append(str(rel_path))
-
-    except (zipfile.BadZipFile, tarfile.TarError) as e:
-        # 如果压缩包损坏，当作单文件处理
-        return _install_single_file(
-            data.decode("utf-8", errors="replace"), url, skill_name, skills_dir
-        )
-
-    # 如果没有安装任何文件，返回警告
-    if not files_installed:
-        return "警告: 压缩包中未找到有效文件"
-
-    # 安装依赖（如果存在 requirements.txt）
-    _install_dependencies(skill_dir)
-
-    # 记录安装日志
-    agent_logger.info(
-        f"Skill installed from archive: {skill_name} ({len(files_installed)} files)"
-    )
-    # 返回成功信息
-    return (
-        f"✅ Skill 安装成功!\n"
-        f"名称: {skill_name}\n"
-        f"路径: {skill_dir}\n"
-        f"文件数: {len(files_installed)}\n"
-        f"文件列表:\n" +
-        "\n".join(f"  - {f}" for f in files_installed[:20]) +
-        (f"\n  ... 共 {len(files_installed)} 个文件" if len(files_installed) > 20 else "") +
-        f"\n来源: {url}\n\n"
-        f"该 Skill 已可用，Agent 在后续对话中会自动加载。"
-    )
-
-
-def _extract_all_files(zf: zipfile.ZipFile, skill_dir: Path, files_installed: list):
-    """提取 ZIP 中所有有意义的文件（当没有 SKILL.md 时）"""
-    # 遍历 ZIP 中的所有成员
-    for member in zf.namelist():
-        # 跳过目录、MacOS 系统文件、隐藏文件
-        if member.endswith("/") or "/__MACOSX/" in member or member.startswith("."):
-            continue
-        # 剥离顶层目录
-        parts = member.split("/", 1)
-        rel_path = parts[1] if len(parts) > 1 else parts[0]
-        if rel_path:
-            # 写入文件
-            _write_member(zf, member, skill_dir / rel_path, files_installed)
-
-
-def _write_member(zf: zipfile.ZipFile, member: str, target: Path, files_installed: list):
-    """写入单个 ZIP 成员到宿主机文件系统"""
-    # 创建父目录
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # 从 ZIP 中读取内容并写入目标文件
-    with zf.open(member) as src:
-        target.write_bytes(src.read())
-    # 记录已安装的文件（相对于父父目录的路径）
-    files_installed.append(str(target.relative_to(target.parent.parent)))
-
-
-def _install_single_file(
-    content: str,
-    url: str,
-    skill_name: str,
-    skills_dir: Path,
-) -> str:
-    """安装单个 .md 文件（向后兼容，创建标准文件夹结构）"""
-    # 构建技能目录
-    skill_dir = skills_dir / skill_name
-    # 创建技能目录
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    # 将内容写入 SKILL.md
-    file_path = skill_dir / "SKILL.md"
-    file_path.write_text(content, encoding="utf-8")
-
-    # 记录安装日志
-    agent_logger.info(f"Skill installed (single file): {skill_name} from {url}")
-    # 返回成功信息
-    return (
-        f"✅ Skill 安装成功!\n"
-        f"名称: {skill_name}\n"
-        f"路径: {skill_dir}\n"
-        f"文件: SKILL.md ({len(content)} 字符)\n"
-        f"来源: {url}\n\n"
-        f"注意: 这是一个单文件 Skill。如需脚本和依赖，请提供包含完整 Skill 文件夹的 ZIP 压缩包。\n"
-        f"该 Skill 已可用，Agent 在后续对话中会自动加载。"
-    )
+# ⚠️ 以下 4 个函数（_install_from_archive / _extract_all_files / _write_member / _install_single_file）
+# 已在"清理死代码"提交中移除——它们是绕过沙箱验证的旧实现，直接从压缩包解压到宿主机，
+# 未被任何代码调用。现在 Skill 安装统一走 install_skill 的沙箱验证流程。
 
 
 def _install_dependencies(skill_dir: Path):
@@ -3009,26 +2915,171 @@ class SandboxBackendProxy:
 
 ## 第6章 — 中间件栈
 
-> 中间件是 Harness 架构的核心扩展点。7 个自定义中间件按照固定顺序执行，分别负责沙箱健康、上下文注入、技能同步、偏好提取、熔断保护等。
+> 中间件是 Harness 架构的核心扩展点。7 个自定义中间件 + Harness 阶段状态机 + RubricMiddleware 评审器，按照固定顺序执行。
 
 ### 中间件执行顺序
 
 ```
-before_agent 阶段（Agent 执行前）：
+before_agent 阶段（Agent 执行前，按注册顺序执行）：
   1. SandboxHealthMiddleware    → ping 沙箱，不可达则重建
-  2. ContextInjectionMiddleware → 注入用户偏好/身份
-  3. SkillsSyncMiddleware       → 同步技能文件到沙箱
-  4. UserSkillsRestoreMiddleware → 恢复持久化技能
-  5. ToolsSummarizationMiddleware → 检查上下文长度
+  2. HarnessPhaseMiddleware     → ★识别任务类型→注入 rubric→置 phase=planning
+  3. ContextInjectionMiddleware → 注入用户偏好/身份
+  4. SkillsSyncMiddleware       → 同步技能文件到沙箱
+  5. UserSkillsRestoreMiddleware → 恢复持久化技能
+  6. ToolsSummarizationMiddleware → 检查上下文长度
+  7. MemoryUpdateMiddleware     → 提取并持久化用户偏好
+  8. SandboxCircuitBreakerMiddleware → 熔断器保护
 
-after_agent 阶段（Agent 执行后）：
-  6. MemoryUpdateMiddleware     → 提取并持久化用户偏好
+after_model 阶段（每次模型调用后）：
+  HarnessPhaseMiddleware → 模型返回工具调用时置 phase=executing
 
-wrap_tool_call 阶段（每次工具调用）：
-  7. SandboxCircuitBreakerMiddleware → 熔断器保护
+after_agent 阶段（Agent 执行后，按逆序执行）：
+  RubricMiddleware     → ★grader 子Agent 对照 rubric 打分，needs_revision 打回重做
+  HarnessPhaseMiddleware → 构建结构化 review_result，置终态 phase
 
 最后：ModelCallLimitMiddleware + ToolCallLimitMiddleware（框架内置）
 ```
+
+> **关键设计（本次改造）**：`before_agent` 按注册顺序、`after_agent` 按逆序执行。
+> 因此 `[HarnessPhaseMiddleware, RubricMiddleware]` 的注册顺序恰好保证：
+> - before 阶段先注入 rubric，评审器随后据此重置评分状态
+> - after 阶段评审器先打分，Harness 中间件再根据 `_rubric_status` 置终态阶段
+
+### 6.0 `src/agent/harness.py` — Harness 阶段状态机 + rubric 注入（★新增）
+
+**作用**：这是"真 Harness 架构"的核心模块。它将 Planning → Executing → Review → Result 四阶段从 prompt 软约束升级为 **graph state 中的结构化字段**，并把评审交给框架原生 `RubricMiddleware`。
+
+```python
+"""
+Harness 编排模块（真 Harness 架构核心）
+职责：
+1. HarnessPhaseState — 扩展 LangGraph 状态（phase / plan / review_result）
+2. load_harness_config — 加载声明式 DSL 配置（harness_config.yaml）
+3. build_rubric / detect_task_type — 按任务类型生成评审标准
+4. HarnessPhaseMiddleware — 阶段状态机 + rubric 注入
+"""
+from typing_extensions import NotRequired, TypedDict
+from langchain.agents.middleware import AgentMiddleware, Runtime
+from langchain.agents.middleware.types import AgentState
+from .schema import Phase, ReviewResult
+from .log_utils import agent_logger
+
+HARNESS_CONFIG_PATH = Path(__file__).parent / "harness_config.yaml"
+
+
+class HarnessPhaseState(AgentState):
+    """Harness 扩展状态：在 DeepAgentState 基础上增加阶段/计划/评审字段。
+
+    通过 HarnessPhaseMiddleware.state_schema 声明，由框架自动合并进 graph state，
+    因此这些字段会出现在 checkpoint 和 values 流中（可观测、可恢复）。
+    """
+    phase: NotRequired[str]      # 当前阶段：planning/executing/reviewing/result
+    plan: NotRequired[dict]      # 结构化任务规划
+    review_result: NotRequired[dict]  # 评审结果
+
+
+def load_harness_config(config_path=None) -> dict:
+    """加载 Harness DSL 配置，缺失时回退到 _DEFAULT_CONFIG"""
+    ...
+
+
+def detect_task_type(messages, config) -> str:
+    """根据用户消息关键词识别任务类型（analysis/order/inventory/supplier/default）"""
+    ...
+
+
+def build_rubric(task_type, config) -> str:
+    """按任务类型生成评审标准字符串（交给 RubricMiddleware 打分）"""
+    ...
+
+
+class HarnessPhaseMiddleware(AgentMiddleware):
+    """Harness 阶段状态机中间件。"""
+    state_schema = HarnessPhaseState
+
+    def before_agent(self, state, runtime):
+        """识别任务类型 → 注入 rubric（激活评审器）→ 置 phase=planning"""
+        updates = {"phase": Phase.planning.value}
+        if not state.get("rubric"):
+            task_type = detect_task_type(state.get("messages", []), self._config)
+            rubric = build_rubric(task_type, self._config)
+            if rubric:
+                updates["rubric"] = rubric
+        return updates
+
+    def after_model(self, state, runtime):
+        """模型返回工具调用 → 置 phase=executing（结构性写入，非正则猜测）"""
+        messages = state.get("messages", [])
+        if messages and getattr(messages[-1], "tool_calls", None):
+            return {"phase": Phase.executing.value}
+        return None
+
+    def after_agent(self, state, runtime):
+        """根据评审状态置终态 + 构建结构化 review_result 持久化到 checkpoint"""
+        status = state.get("_rubric_status")
+        updates = {}
+        if status:
+            evaluations = state.get("_rubric_evaluations") or []
+            last = evaluations[-1] if evaluations else {}
+            updates["review_result"] = ReviewResult(
+                verdict=status,
+                explanation=last.get("explanation", ""),
+                criteria=[dict(c) for c in last.get("criteria", [])],
+                iteration=last.get("iteration", 0),
+            ).model_dump()
+        updates["phase"] = (
+            Phase.reviewing.value if status == "needs_revision"
+            else Phase.result.value
+        )
+        return updates
+```
+
+**配套 DSL 配置** `harness_config.yaml`（声明式，改流程不改代码）：
+
+```yaml
+phases:
+  - name: planning
+    label: "📝 规划中"
+  - name: executing
+    label: "⚙️ 执行中"
+  - name: reviewing
+    label: "🔍 审查中"
+  - name: result
+    label: "📊 已完成"
+
+review:
+  max_iterations: 3          # 单次 rubric 最多评审迭代次数
+  model: null                # 使用主 LLM
+
+task_types:                  # 任务类型识别关键词（自动选择 rubric）
+  analysis: {keywords: [分析, 对比, 统计, 趋势, 报表, 图表, 报告, 评估]}
+  order:    {keywords: [下单, 采购, 订单, 新增, 修改, 审批, 创建]}
+  inventory:{keywords: [库存, 入库, 出库, 盘点, 预警]}
+  supplier: {keywords: [供应商, 供货, 信用]}
+
+rubrics:                     # 各任务类型评审标准（"什么算完成"）
+  analysis: |
+    1. 使用 MCP 工具获取了真实业务数据
+    2. 输出了包含数据表格的结构化分析报告
+    3. 生成了可视化图表
+    4. 分析结论有明确的数据支撑
+  order: |
+    1. 提取了完整的订单字段
+    2. 数据校验通过：quantity >= 1，unitPrice > 0
+    3. 创建/修改前展示了完整订单摘要
+    4. 写操作已触发人工审批中断
+  # ... default / inventory / supplier
+
+observability:
+  trace_phase_transitions: true
+```
+
+**设计决策**：
+- 为什么阶段是 `NotRequired[str]` 而非 `Enum`？→ LangGraph state 必须可 JSON 序列化（checkpoint 持久化），存枚举的 `.value`
+- 为什么 rubric 在 `before_agent` 注入而非构造时？→ rubric 需根据用户消息的任务类型动态选择
+- 为什么 `after_model` 才置 executing？→ 只有模型真正产出工具调用才算进入执行阶段
+
+
 
 ### 6.1 `sandbox_health.py` — 沙箱健康检查（92行）
 
@@ -3619,9 +3670,11 @@ system_prompt: |
   格式：PO + 年月日 + 3位序号，例如 PO20260727001
 ```
 
-### 7.3 `src/agent/subagents/loader.py` — YAML 加载器（217行）
+### 7.3 `src/agent/subagents/loader.py` — YAML 加载器（含输出契约校验）
 
-**作用**：读取 YAML 配置 → 校验 → 工具名解析 → interrupt_on 解析 → 构造 SubAgent 实例。
+**作用**：读取 YAML 配置 → 校验 → 工具名解析 → interrupt_on 解析 → **输出契约校验与注入** → 构造 SubAgent 实例。
+
+**本次改造**：新增 `output_format` 契约校验，使 YAML 中声明的输出结构从"仅声明"变为"必须遵守的契约"，由主 Agent 评审器依据评审标准对子 Agent 输出做校验。
 
 ```python
 """
@@ -3659,6 +3712,71 @@ def _validate_subagent_config(config: dict) -> bool:
     # 使用 all() 检查每个必填字段是否都存在且非空
     # config[field] 在字段存在且值非空时返回 True
     return all(field in config and config[field] for field in REQUIRED_FIELDS)
+
+
+def _get_output_format(config: dict) -> dict | None:
+    """提取子Agent的输出契约定义（兼容顶层 output_format 或 context_protocol.output_format）"""
+    output_format = config.get("output_format")
+    if isinstance(output_format, dict):
+        return output_format
+    protocol = config.get("context_protocol")
+    if isinstance(protocol, dict):
+        nested = protocol.get("output_format")
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _validate_output_format(config: dict) -> bool:
+    """校验子Agent的 output_format 契约结构（声明式输出契约的强校验）
+
+    校验规则：
+    - output_format 必须为 dict
+    - 若含 sections 字段，必须是字符串列表
+    """
+    output_format = _get_output_format(config)
+    if output_format is None:
+        return True  # 未声明输出契约，不强制
+    sections = output_format.get("sections")
+    if sections is not None and (
+        not isinstance(sections, list)
+        or not all(isinstance(s, str) for s in sections)
+    ):
+        agent_logger.error(
+            f"Invalid output_format.sections in {config.get('name')}: must be a list of strings"
+        )
+        return False
+    return True
+
+
+def build_output_contract_prompt(config: dict) -> str:
+    """根据 output_format 生成输出契约提示词（注入子Agent system_prompt）。
+
+    使 YAML 中声明的输出结构成为子Agent必须遵守的显式契约，
+    并由主Agent的 RubricMiddleware 依据评审标准对子Agent输出做校验。
+    """
+    output_format = _get_output_format(config)
+    if output_format is None:
+        return ""
+
+    fmt_type = output_format.get("type", "structured_report")
+    sections = output_format.get("sections", [])
+    fmt = output_format.get("format", "markdown")
+
+    if not sections:
+        return ""
+
+    lines = [
+        "\n\n## 输出契约（必须严格遵守）",
+        f"你的最终返回结果必须符合以下结构化契约（类型：{fmt_type}，格式：{fmt}）：",
+    ]
+    for i, section in enumerate(sections, 1):
+        lines.append(f"{i}. **{section}**")
+
+    lines.append(
+        "主Agent 将依据此契约对你的输出进行校验；缺失任一 section 将被视为不合格并触发返工。"
+    )
+    return "\n".join(lines)
 
 
 def _parse_interrupt_on(config: dict) -> dict | None:
@@ -3775,12 +3893,17 @@ def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> li
         
         # 解析 interrupt_on 配置
         interrupt_on = _parse_interrupt_on(config)
-        
+
+        # 校验 output_format 契约结构（非法则记录错误，仍继续创建但契约不注入）
+        output_contract = ""
+        if _validate_output_format(config):
+            output_contract = build_output_contract_prompt(config)
+
         # 构建子Agent规格字典
         subagent_spec = {
             "name": config["name"],  # 子Agent名称
             "description": config["description"],  # 子Agent描述
-            "system_prompt": config["system_prompt"],  # 系统提示词
+            "system_prompt": config["system_prompt"] + output_contract,  # ★注入输出契约
             "tools": matched_tools,  # 匹配到的实际工具对象
         }
         
@@ -3867,30 +3990,27 @@ MAIN_SYSTEM_PROMPT = """你是"智能采购助手"，基于 Harness Engineering 
 
 ## ❗ 核心工作流程（Harness 思想，必须严格遵守）
 
-重要：对于简单问候、闲聊、简单问答（如"hi""你好"），直接简洁回答，不需要输出规划。
+重要：对于简单问候、闲聊、简单问答（如"hi""你好""你是谁"），直接简洁回答即可，不需要规划。
 
-仅对于需要调用工具或多步骤操作的复杂任务，才按以下步骤执行：
+仅对于需要调用工具或多步骤操作的复杂任务，遵循以下四阶段工作流：
 
 ### Step 1: 📝 Planning（规划）
-- 在回复开头明确输出你的任务规划
-- 格式：
-```
-  📝 任务规划：
-  1. [xxx] 查询xxx数据
-  2. [xxx] 分析xxx
-  3. [xxx] 生成结果
-  ```
+- 使用 write_todos 工具创建结构化任务清单（不要在正文输出规划文本）
+- 将任务拆分为可执行的步骤，每个步骤作为一条 todo 项
+- 开始执行前将首条任务标记为 in_progress
 
 ### Step 2: ⚙️ Executing（执行）
-- 按计划逐步执行，每完成一步显示进度
-- 格式："✅ Step 1 完成：已获取 36 家供应商数据"
+- 按 todo 清单逐步执行，完成一步立即用 write_todos 标记该步为 completed
+- 调用工具时简要说明正在做什么
+- 格式："✅ 已获取 36 家供应商数据"
 
 ### Step 3: 🔍 Review（审查）
-- 执行完成后审视结果是否合理
-- 格式："🔍 审查：数据完整，共 36 条记录，无异常"
+- 系统评审器会自动对照评审标准检查你的执行结果
+- 若评审未通过，请依据反馈修正后重新输出
 
 ### Step 4: 📊 Result（结果）
 - 最终结构化输出结果
+- 提供下一步建议
 
 ## 核心能力
 1. 供应商管理 - 查询、搜索、分析
@@ -3911,6 +4031,8 @@ MAIN_SYSTEM_PROMPT = """你是"智能采购助手"，基于 Harness Engineering 
 **设计要点**：
 - `{user_id}` / `{username}` / `{preferences}` 是模板变量，在 `main_agent.py` 中通过 `.format()` 填充
 - Harness 4 步工作流（Planning → Executing → Review → Result）是核心思想
+- **规划改用 `write_todos` 工具**（结构化 todo），而非在正文输出规划文本——与 `TodoListMiddleware` 对齐，供 `chat.py` 从 state 读取
+- **审查由系统评审器自动完成**（`RubricMiddleware`），不再要求 LLM 输出"审查"自述文本
 - 简单问候不需要规划，避免"hi"也输出任务列表
 
 ---
@@ -4021,7 +4143,7 @@ def get_order_middleware() -> list:
 DeepAgent 核心组装 — 严格遵循 Harness Engineering 架构
 """
 import io, tarfile, fnmatch
-from deepagents import create_deep_agent
+from deepagents import create_deep_agent, RubricMiddleware  # ★评审器
 from deepagents.backends import CompositeBackend, StoreBackend, LocalShellBackend
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 from .backends.custom_opensandbox import DockerSandboxBackend
@@ -4112,15 +4234,23 @@ def create_main_agent(user_context=None, checkpointer=None, store=None):
     from .middlewares.tools_summarization import ToolsSummarizationMiddleware
     from .middlewares.memory_update import MemoryUpdateMiddleware
     from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
+    from .harness import HarnessPhaseMiddleware, load_harness_config  # ★Harness 核心
+
+    # 读取 Harness DSL 配置中的评审迭代上限
+    _harness_config = load_harness_config()
+    _review_max_iterations = _harness_config.get("review", {}).get("max_iterations", 3)
 
     middlewares = [
         SandboxHealthMiddleware(),                                    # 1. 沙箱健康
-        ContextInjectionMiddleware(user_context=user_context),        # 2. 上下文注入
-        SkillsSyncMiddleware(skills_dir=SKILLS_DIR),                  # 3. 技能同步
-        UserSkillsRestoreMiddleware(store=store, user_id=user_context.user_id),  # 4. 技能恢复
-        ToolsSummarizationMiddleware(),                               # 5. 摘要监控
-        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 6. 偏好提取
-        SandboxCircuitBreakerMiddleware(failure_threshold=3),         # 7. 熔断器
+        HarnessPhaseMiddleware(),                                     # 2. ★阶段状态机 + rubric 注入
+        ContextInjectionMiddleware(user_context=user_context),        # 3. 上下文注入
+        SkillsSyncMiddleware(skills_dir=SKILLS_DIR),                  # 4. 技能同步
+        UserSkillsRestoreMiddleware(store=store, user_id=user_context.user_id),  # 5. 技能恢复
+        ToolsSummarizationMiddleware(),                               # 6. 摘要监控
+        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 7. 偏好提取
+        SandboxCircuitBreakerMiddleware(failure_threshold=3),         # 8. 熔断器
+        # ★ Harness 评审器：grader 子Agent 结构化打分，needs_revision 打回重做
+        RubricMiddleware(model=llm, max_iterations=_review_max_iterations),
         ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),          # 框架内置：LLM调用上限
         ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),            # 框架内置：工具调用上限
     ]
@@ -4170,11 +4300,13 @@ def create_main_agent(user_context=None, checkpointer=None, store=None):
 | 框架警告 | ❌ 每次启动报错 | ✅ 完全消除 |
 
 **Harness 架构思想在代码中的体现**：
-1. **Planning → Executing → Review → Result**：写在系统提示词中，LLM 被强制要求遵循
-2. **中间件栈**：7 个中间件提供可扩展的 before/after/wrap 钩子
-3. **子Agent 委派**：通过 YAML 声明式配置，主Agent 自动路由
+1. **Planning → Executing → Review → Result**：不再是 prompt 软约束，而是 `HarnessPhaseMiddleware` 写入的 graph state 结构化字段 + `RubricMiddleware` 评审回路
+2. **中间件栈**：7 个自定义中间件 + Harness 阶段状态机 + 评审器，提供可扩展的 before/after/wrap 钩子
+3. **子Agent 委派**：通过 YAML 声明式配置，主Agent 自动路由；输出契约由 loader 校验注入
 4. **CompositeBackend**：不同路径路由到不同后端（沙箱/Store）
 5. **HITL**：`interrupt_on` 配置让危险操作必须经过人工审批
+
+**评审回路（Review Loop）**：`RubricMiddleware` 收到 `HarnessPhaseMiddleware` 注入的 rubric 后，用独立的 grader 子 Agent 对照执行记录逐条打分；判定 `needs_revision` 时自动注入反馈并 `jump_to=model` 重做，最多迭代 `max_iterations`（DSL 可配）次，形成真正的 Review 回路。
 
 ---
 
@@ -4264,11 +4396,31 @@ class AgentLoader:
 agent_loader = AgentLoader()  # 全局单例
 ```
 
+**本次改造新增**：`save_harness_trace` 方法 — 将 Harness 阶段流转 trace 持久化到 MongoDB `harness_traces` 集合，支持事后审计"哪一步卡住了"。
+
+```python
+async def save_harness_trace(self, thread_id: str, trace: list):
+    """保存 Harness 阶段流转 trace 到 MongoDB（可观测/审计）
+
+    记录 Planning → Executing → Review → Result 各阶段的流转时间线，
+    以及评审器的结构化判定结果。
+    """
+    db = get_db()
+    await db.harness_traces.update_one(
+        {"thread_id": thread_id},
+        {"$set": {"trace": trace, "updated_at": datetime.now().isoformat()}},
+        upsert=True,
+    )
+```
+
+`delete_conversation` 同步清理 `harness_traces` 集合，保证删除会话时 trace 一并清除。
+
 **新增文件**：`src/api_view/mongodb_store.py` — 自定义 `BaseStore` 的 MongoDB 实现，支持 `get`/`put`/`search`/`delete`/`list_namespaces` 接口。
 
 **与旧版的关键区别**：
 - `MemorySaver()` → `MongoDBSaver(MongoClient)` — 会话状态重启不丢失
 - `InMemoryStore()` → `MongoDBStore(MongoDB)` — 用户偏好/技能跨会话持久化
+- 新增 `harness_traces` 集合 — 阶段流转可观测 trace
 
 ### 10.3 `src/api_view/api/history.py` — 历史会话 CRUD（31行）
 
@@ -4296,25 +4448,29 @@ async def delete_conversation(thread_id: str):
     return {"success": True}
 ```
 
-### 10.4 `src/api_view/api/chat.py` — SSE 流式对话（347行，核心）
+### 10.4 `src/api_view/api/chat.py` — SSE 流式对话（核心）
 
 **这是整个 Web 层最核心的文件**。它实现了：
 - SSE 流式响应（逐 token 推送）
 - 中断检测（HITL 审批/信息补充）
-- Harness 阶段检测（Planning/Executing/Review）
-- TODO 任务列表更新
-- 消息持久化
+- **结构化 Harness 阶段读取（替代正则猜测）**
+- **结构化 TODO 列表读取（替代正则提取编号）**
+- **评审结果读取（custom 流 rubric 事件）**
+- 阶段流转 trace 收集 + 消息持久化
 
 ```python
 """
 核心 SSE 流式对话 + 中断检测 + 中断恢复 + 展示消息持久化
 
 关键设计：
-- 双模式流: stream_mode=["messages", "values"], subgraphs=True
-- 中断检测在 messages 处理之前（values 流优先）
-- SSE 事件协议: thinking / token / tool_start / tool_args / tool_result / tool_end / phase / todo_update / interrupt / done
+- 三模式流: stream_mode=["messages", "values", "custom"], subgraphs=True
+- 阶段流转从 values 流的 state.phase 读取（HarnessPhaseMiddleware 写入）
+- todo 列表从 values 流的 state.todos 读取（TodoListMiddleware 写入）
+- 评审结果从 custom 流的 rubric_evaluation_start/end 事件读取
+- SSE 事件协议: thinking / token / tool_start / tool_args / tool_result / tool_end
+  / phase / todo_update / review_result / interrupt / done
 """
-import json, re, uuid
+import json, uuid
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
@@ -4322,6 +4478,12 @@ from ..agent_loader import agent_loader
 from ...agent.schema import ChatRequest, ResumeRequest
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+# Harness 阶段 → 前端展示文案
+PHASE_LABELS = {
+    "planning": "📝 规划中", "executing": "⚙️ 执行中",
+    "reviewing": "🔍 审查中", "result": "📊 已完成", "thinking": "💭 思考中",
+}
 
 
 def sse_event(event: str, data: dict) -> str:
@@ -4331,10 +4493,11 @@ def sse_event(event: str, data: dict) -> str:
 
 async def stream_chat_response(message, thread_id, user_id="default_user", resume_data=None):
     """核心流式响应生成器
-    
-    双流模式（subgraphs=True 时输出为 3-tuple）：
-    - (namespace, "values", data): 检测中断
+
+    三模式流（subgraphs=True 时输出为 3-tuple）：
+    - (namespace, "values", data): 读 phase/todos + 检测中断
     - (namespace, "messages", data): 逐 token + 工具调用
+    - (namespace, "custom", data): 评审器 rubric_evaluation_start/end 事件
     """
     config = agent_loader.create_config(thread_id)
     display_messages = await agent_loader.get_display_messages(thread_id)
@@ -4347,21 +4510,64 @@ async def stream_chat_response(message, thread_id, user_id="default_user", resum
 
     assistant_content = ""
     tool_calls_buffer = []
-    phase = "thinking"  # 当前 Harness 阶段
+    phase = "thinking"
+    last_phase = "thinking"       # 上次已发射阶段（去重）
+    last_todos_sig = None         # 上次 todo 列表签名（去重）
+    harness_trace = []            # Harness 阶段流转 trace（可观测）
 
     yield sse_event("thinking", {"status": "start"})
 
     async for namespace, chunk_type, chunk in agent_loader.agent.astream(
         input=current_input, config=config,
-        stream_mode=["messages", "values"], subgraphs=True,
+        stream_mode=["messages", "values", "custom"], subgraphs=True,
     ):
-        # ===== 中断检测（values 流优先）=====
-        if chunk_type == "values" and chunk.get("interrupts"):
-            # 判断中断类型 → 发射 interrupt SSE 事件
-            # 保存消息 → done(interrupted=True) → return
-            ...
+        # ===== values 流：结构化阶段/todo + 中断检测 =====
+        if chunk_type == "values":
+            # ★ 阶段流转（来自 HarnessPhaseMiddleware 写入的 state.phase）
+            new_phase = chunk.get("phase")
+            if new_phase and new_phase != last_phase:
+                last_phase = new_phase
+                phase = new_phase
+                harness_trace.append({"type": "phase", "phase": new_phase,
+                                      "label": PHASE_LABELS.get(new_phase, new_phase),
+                                      "timestamp": datetime.now().isoformat()})
+                yield sse_event("phase", {"phase": new_phase, "label": PHASE_LABELS.get(new_phase, new_phase)})
 
-        # ===== Messages 流处理 =====
+            # ★ 结构化 todo（来自 TodoListMiddleware 的 write_todos 状态）
+            todos = chunk.get("todos")
+            if todos is not None:
+                todos_sig = json.dumps(todos, ensure_ascii=False, sort_keys=True)
+                if todos_sig != last_todos_sig:
+                    last_todos_sig = todos_sig
+                    plan_items = [{"id": f"todo-{i}", "content": t.get("content",""),
+                                   "status": t.get("status","pending")}
+                                  for i, t in enumerate(todos)]
+                    if plan_items:
+                        yield sse_event("todo_update", {"phase": "planning", "todos": plan_items})
+
+            # 中断检测
+            if chunk.get("interrupts"):
+                # 判断中断类型 → 发射 interrupt SSE 事件
+                # 保存消息 + trace → done(interrupted=True) → return
+                ...
+
+        # ===== custom 流：评审器结构化事件 =====
+        if chunk_type == "custom":
+            ev_type = chunk.get("type", "")
+            if ev_type == "rubric_evaluation_start":
+                if phase != "reviewing":
+                    phase = "reviewing"
+                    yield sse_event("phase", {"phase": "reviewing", "label": "🔍 审查中"})
+            elif ev_type == "rubric_evaluation_end":
+                review_data = {"verdict": chunk.get("result",""),
+                               "explanation": chunk.get("explanation",""),
+                               "criteria": chunk.get("criteria", []),
+                               "iteration": chunk.get("iteration", 0)}
+                harness_trace.append({"type": "review", **review_data,
+                                      "timestamp": datetime.now().isoformat()})
+                yield sse_event("review_result", review_data)
+
+        # ===== messages 流：token + 工具调用 =====
         if chunk_type == "messages":
             token = chunk[0] if isinstance(chunk, (list, tuple)) else chunk
             tool_call_chunks = getattr(token, "tool_call_chunks", None)
@@ -4381,23 +4587,16 @@ async def stream_chat_response(message, thread_id, user_id="default_user", resum
                 yield sse_event("tool_end", {"id": getattr(token, "tool_call_id", "")})
                 continue
 
-            # 文本 token → token 事件 + 阶段检测
+            # 文本 token → token 事件（阶段不再靠正则，直接从 state 读）
             content = getattr(token, "content", "")
             if content and isinstance(content, str):
                 assistant_content += content
-                # Planning 检测：严格匹配（标题头 + 编号步骤 + 内容>80字）
-                if not planning_emitted and len(assistant_content) > 80:
-                    if re.search(r'(任务规划|Planning)', assistant_content):
-                        plan_items = re.findall(r'\d+[.、)]\s*(.+?)(?:\n|$)', assistant_content)
-                        if len(plan_items) >= 2:
-                            yield sse_event("todo_update", {"phase": "planning", "todos": [...]})
-                            yield sse_event("phase", {"phase": "planning", "label": "📝 规划中"})
-                # 判断来源（main/analyst/order）
                 source = "analyst" if "analyst" in str(namespace) else "main"
                 yield sse_event("token", {"content": content, "source": source})
 
-    # 流结束 → 保存消息 → 保存会话 → done
+    # 流结束 → 保存消息 + trace → 保存会话 → done
     await agent_loader.save_display_messages(thread_id, display_messages)
+    await agent_loader.save_harness_trace(thread_id, harness_trace)
     await agent_loader.save_conversation(thread_id, user_id, title)
     yield sse_event("done", {"thread_id": thread_id, "interrupted": False})
 
@@ -4422,6 +4621,16 @@ async def chat_resume(thread_id: str, request: ResumeRequest):
     )
 ```
 
+**关键设计变化（本次改造）**：
+
+| 维度 | 旧版（正则猜测） | 新版（结构化 state） |
+|------|------------------|----------------------|
+| 阶段检测 | `re.search(r'(任务规划\|Planning)', 文本)` | 读 `state.phase`（`HarnessPhaseMiddleware` 写入） |
+| todo 列表 | `re.findall(r'\d+[.、)]\s*...', 文本)` | 读 `state.todos`（`TodoListMiddleware` 写入） |
+| Review 检测 | `marker in content`（"审查"/"🔍"） | 读 `custom` 流 `rubric_evaluation_end` 事件 |
+| stream_mode | `["messages", "values"]` | `["messages", "values", "custom"]` |
+| 可观测性 | 无 | `harness_trace` 持久化到 MongoDB |
+
 **SSE 事件协议完整列表**：
 
 | 事件 | data | 触发时机 |
@@ -4432,8 +4641,9 @@ async def chat_resume(thread_id: str, request: ResumeRequest):
 | `tool_args` | `{args}` | 工具参数（流式） |
 | `tool_result` | `{name, content}` | 工具返回结果 |
 | `tool_end` | `{id}` | 工具调用结束 |
-| `phase` | `{phase, label}` | Harness 阶段变化 |
-| `todo_update` | `{phase, todos}` | 任务规划更新 |
+| `phase` | `{phase, label}` | Harness 阶段变化（结构化） |
+| `todo_update` | `{phase, todos}` | 任务规划更新（结构化） |
+| `review_result` | `{verdict, explanation, criteria, iteration}` | ★评审器判定结果 |
 | `interrupt` | `{interrupt_type, ...}` | 中断（审批/补充） |
 | `done` | `{thread_id, interrupted}` | 流结束 |
 | `error` | `{message}` | 错误 |
@@ -4624,15 +4834,17 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 
 **核心文件阅读顺序推荐**：
 1. `config.py` → 了解所有配置
-2. `main_agent.py` → 了解 Agent 如何组装（含沙箱初始化、Skills 加载、项目文件上传）
-3. `custom_opensandbox.py` → 了解沙箱后端（30+ 方法、文件操作、多语言运行时）
-4. `sandbox_holder.py` → 了解工具如何全局访问沙箱
-5. `chart_generator.py` → 了解沙箱内代码执行模式
-6. `chat.py` → 了解 SSE 流式对话
-7. `skills_sync.py` → 了解技能增量同步机制
+2. `main_agent.py` → 了解 Agent 如何组装（含沙箱初始化、Skills 加载、Harness 中间件）
+3. `harness.py` → ★了解 Harness 阶段状态机 + rubric 注入 + 评审回路
+4. `harness_config.yaml` → ★了解声明式工作流配置（四阶段/评审标准）
+5. `custom_opensandbox.py` → 了解沙箱后端（30+ 方法、文件操作、多语言运行时）
+6. `sandbox_holder.py` → 了解工具如何全局访问沙箱
+7. `chart_generator.py` → 了解沙箱内代码执行模式
+8. `chat.py` → 了解 SSE 流式对话 + 结构化阶段读取
+9. `skills_sync.py` → 了解技能增量同步机制
 
 **关键设计模式**：
-- **Harness 工作流**：Planning → Executing → Review → Result（写在提示词中）
+- **Harness 工作流**：Planning → Executing → Review → Result 已从 prompt 软约束升级为 graph state 结构化字段（`HarnessPhaseMiddleware`）+ 评审回路（`RubricMiddleware`）
 - **沙箱优先**：所有代码执行/文件生成强制在 Docker 沙箱内，宿主机只跑框架
 - **中间件栈**：可扩展的 before/after/wrap 钩子
 - **CompositeBackend**：路径路由到不同后端
@@ -4640,6 +4852,8 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 - **HITL**：interrupt/resume 实现人工审批
 - **熔断器**：三态模型保护沙箱调用
 - **sandbox_holder**：全局单例，工具通过 `get_sandbox()` 访问沙箱
+- **评审回路**：grader 子 Agent 对照 rubric 打分，needs_revision 自动打回重做
+- **可观测 trace**：阶段流转 + 评审判定持久化到 MongoDB
 
 ---
 
@@ -4666,3 +4880,38 @@ hitl_tools.py → parse_supplement_text() → validate_order_data() → 数据�
 | `web_fetch.py` | 直接解压到宿主机 | ✅ 沙箱隔离流程：下载→验证→通过→安装 |
 | `main_agent.py` | `skills=["path"]` 报 `path_not_found` | ✅ `skills=None` + `_load_skills_prompt` 手动注入 |
 | `main_agent.py` | 无项目文件同步 | ✅ `_upload_project_to_sandbox` 启动时上传 125+ 文件 |
+
+---
+
+## 更新日志（2026-08-26 Harness 架构真改造）
+
+本次改造将 Harness 架构从"prompt 软约束 + 正则猜测"升级为"结构化状态 + 评审回路"，共 8 个提交。核心变化：
+
+| 文件 | 旧版问题 | 新版方案 |
+|------|----------|----------|
+| `schema.py` | 无阶段/计划/评审模型 | ★新增 `Phase`/`PlanStep`/`Plan`/`ReviewResult` 强类型模型 |
+| `harness.py` | 不存在 | ★新增：阶段状态机 + rubric 注入 + 任务类型识别 |
+| `harness_config.yaml` | 不存在 | ★新增：声明式 DSL（四阶段/评审标准/任务类型） |
+| `main_agent.py` | 阶段靠 prompt 软约束 | ★接入 `RubricMiddleware` 评审器 + `HarnessPhaseMiddleware` |
+| `chat.py` | 阶段/todo 靠正则猜文本 | ★改从 values 流读 `state.phase`/`state.todos`，评审从 custom 流读 |
+| `loader.py` | output_format 只声明不校验 | ★新增契约校验 + 输出契约注入子 Agent system_prompt |
+| `prompts.py` | 文本规划格式 | ★改用 `write_todos` 工具 + 评审器自动审查 |
+| `agent_loader.py` | 无可观测 trace | ★新增 `save_harness_trace` 持久化阶段流转 |
+
+**架构转变核心**：
+
+| 维度 | 旧版 | 新版 |
+|------|------|------|
+| Phase | 正则猜 LLM 文本 | `state.phase`（图状态，checkpoint 持久化） |
+| Todo | 正则提编号列表 | `state.todos`（`TodoListMiddleware` 结构化） |
+| Review | LLM 自述"审查" | `RubricMiddleware` grader 子 Agent 打分 + 打回回路 |
+| output_format | 仅 YAML 声明 | 契约校验 + 注入 + 评审器校验 |
+| 可观测 | 无 | `harness_traces` MongoDB 持久化 |
+
+**阶段流转机制**：
+```
+before_agent  → phase=planning（注入 rubric）
+after_model   → phase=executing（模型调用工具时）
+after_agent   → phase=reviewing（needs_revision 打回重做）
+              → phase=result（satisfied/failed/超限）
+```
